@@ -549,9 +549,13 @@ impl Drop for NextConfigOverride {
 }
 
 fn standalone_config_wrapper(original_name: &str, is_esm: bool) -> String {
+    let import_name = original_name
+        .strip_suffix(".ts")
+        .unwrap_or(original_name);
+
     if is_esm {
         format!(
-            "import original from './{original_name}';
+            "import original from './{import_name}';
 
 const forceStandalone = (config) => ({{ ...(config || {{}}), output: 'standalone' }});
 
