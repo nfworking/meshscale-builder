@@ -216,8 +216,6 @@ fn build_application(args: &DeployArgs) -> Result<(Framework, PackageManager, Pa
     run_build(&context)?;
 
     let standalone_dir = prepare_standalone_output(&context)?;
-    install_self_contained_runtime_dependencies(&standalone_dir)
-        .context("failed to install self-contained standalone runtime dependencies")?;
     validate_standalone_output(&standalone_dir)?;
     let output_path = artifact_output_path(&args.build_id)?;
     create_artifact(&standalone_dir, &output_path)?;
@@ -389,7 +387,16 @@ fn install_dependencies(context: &BuildContext) -> Result<()> {
         || context.project_dir.join("yarn.lock").is_file();
 
     let executable = context.package_manager.executable();
-    let args = context.package_manager.install_args(has_lockfile);
+    let mut args = context.package_manager.install_args(has_lockfile);
+
+    // Next.js standalone tracing does not preserve pnpm's isolated symlinked
+    // node_modules layout reliably, especially on Windows where junctions can
+    // survive into the traced output. Build with pnpm's hoisted linker instead:
+    // it creates a flat node_modules tree without dependency symlinks, allowing
+    // Next to trace the actual runtime files into .next/standalone.
+    if matches!(context.package_manager, PackageManager::Pnpm) {
+        args.insert(0, "--config.node-linker=hoisted");
+    }
 
     info!(command = %format_command(executable, &args), "installing dependencies");
     run_command(executable, &args, &context.project_dir, "dependency installation")
@@ -631,45 +638,6 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
     Ok(standalone_dir)
 }
 
-
-fn install_self_contained_runtime_dependencies(standalone_dir: &Path) -> Result<()> {
-    let package_json = standalone_dir.join("package.json");
-    if !package_json.is_file() {
-        bail!(
-            "Next.js standalone output is missing package.json: {}",
-            package_json.display()
-        );
-    }
-
-    let node_modules = standalone_dir.join("node_modules");
-    if node_modules.exists() {
-        fs::remove_dir_all(&node_modules).with_context(|| {
-            format!(
-                "failed to remove Next.js traced node_modules from {}",
-                node_modules.display()
-            )
-        })?;
-    }
-
-    info!(
-        directory = %standalone_dir.display(),
-        "installing runtime dependencies into a clean standalone node_modules"
-    );
-
-    // Next's standalone output contains the runtime package manifest, but pnpm
-    // represents its traced dependency tree using links/junctions. Do not try
-    // to interpret or rewrite that graph. Instead, discard it and ask npm to
-    // materialize the manifest into a conventional filesystem tree.
-    run_command(
-        "npm",
-        &["install", "--omit=dev", "--no-audit", "--no-fund"],
-        standalone_dir,
-        "standalone runtime dependency installation",
-    )
-    .context("failed to materialize runtime dependencies with npm")?;
-
-    Ok(())
-}
 
 fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
     let server = standalone_dir.join("server.js");
