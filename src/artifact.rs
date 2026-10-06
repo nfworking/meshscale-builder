@@ -84,16 +84,17 @@ pub fn create_output(
             "type": "node",
             "command": "node",
             "entrypoint": "runtime/node_modules/next/dist/bin/next",
+            "working_directory": "runtime",
             "args": ["start"]
         },
         "static": {
             "directory": "static"
         },
         "deployment": {
-            "id": metadata.build_id,
-            "repository": metadata.repository,
-            "commit": metadata.commit,
-            "branch": metadata.branch
+            "id": &metadata.build_id,
+            "repository": &metadata.repository,
+            "commit": &metadata.commit,
+            "branch": &metadata.branch
         }
     });
 
