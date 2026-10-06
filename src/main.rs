@@ -633,8 +633,16 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
 }
 
 
-fn is_link_like(metadata: &fs::Metadata) -> bool {
+fn is_link_like(path: &Path, metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    // Windows pnpm uses directory junctions for node_modules entries.
+    // Depending on how metadata is obtained, the reparse-point bit is not
+    // always enough to identify them, so also ask the filesystem whether the
+    // path has a link target.
+    if fs::read_link(path).is_ok() {
         return true;
     }
 
@@ -663,7 +671,7 @@ fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Resu
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(&metadata) {
+    if is_link_like(path, &metadata) {
         return materialize_link_like_in_place(path, active_sources);
     }
 
@@ -699,7 +707,7 @@ fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<(
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(&metadata) {
+    if is_link_like(path, &metadata) {
         materialize_link_like_in_place(path, active_sources)
     } else if metadata.is_dir() {
         materialize_directory(path, active_sources)
@@ -754,7 +762,7 @@ fn copy_resolved_path(
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
 
-    if is_link_like(&metadata) {
+    if is_link_like(path, &metadata) {
         let resolved = source
             .canonicalize()
             .with_context(|| format!("failed to resolve nested linked path {}", source.display()))?;
@@ -825,7 +833,7 @@ fn copy_resolved_entry(
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
 
-    if is_link_like(&metadata) {
+    if is_link_like(path, &metadata) {
         let resolved = source
             .canonicalize()
             .with_context(|| format!("failed to resolve linked path {}", source.display()))?;
@@ -847,7 +855,15 @@ fn remove_path(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(&metadata) || metadata.is_file() {
+    if is_link_like(path, &metadata) {
+        if metadata.is_dir() {
+            fs::remove_dir(path)
+                .with_context(|| format!("failed to remove linked directory {}", path.display()))?;
+        } else {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove linked file {}", path.display()))?;
+        }
+    } else if metadata.is_file() {
         fs::remove_file(path)
             .with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {
@@ -882,7 +898,7 @@ fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(entry.path())
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
 
-        if is_link_like(&metadata) {
+        if is_link_like(path, &metadata) {
             bail!(
                 "standalone output still contains a symbolic link or Windows reparse point: {}",
                 entry.path().display()
