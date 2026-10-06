@@ -633,6 +633,23 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
 }
 
 
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return metadata.file_attributes() & 0x400 != 0;
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn materialize_standalone_output(standalone_dir: &Path) -> Result<()> {
     let mut active_sources = Vec::new();
     materialize_directory(standalone_dir, &mut active_sources)
@@ -646,8 +663,8 @@ fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Resu
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if metadata.file_type().is_symlink() {
-        return materialize_symlink_in_place(path, active_sources);
+    if is_link_like(&metadata) {
+        return materialize_link_like_in_place(path, active_sources);
     }
 
     if !metadata.is_dir() {
@@ -664,15 +681,13 @@ fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Resu
 
     active_sources.push(canonical);
     let result = (|| -> Result<()> {
-        let entries = fs::read_dir(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        for entry in entries {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+        {
             let entry = entry
                 .with_context(|| format!("failed to read an entry in {}", path.display()))?;
             materialize_entry(&entry.path(), active_sources)?;
         }
-
         Ok(())
     })();
     active_sources.pop();
@@ -684,8 +699,8 @@ fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<(
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if metadata.file_type().is_symlink() {
-        materialize_symlink_in_place(path, active_sources)
+    if is_link_like(&metadata) {
+        materialize_link_like_in_place(path, active_sources)
     } else if metadata.is_dir() {
         materialize_directory(path, active_sources)
     } else if metadata.is_file() {
@@ -695,13 +710,13 @@ fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<(
     }
 }
 
-fn materialize_symlink_in_place(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
+fn materialize_link_like_in_place(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
     let resolved = path
         .canonicalize()
-        .with_context(|| format!("failed to resolve symlink {}", path.display()))?;
+        .with_context(|| format!("failed to resolve linked path {}", path.display()))?;
 
     if active_sources.iter().any(|source| source == &resolved) {
-        bail!("detected a symlink cycle while materializing {}", path.display());
+        bail!("detected a linked-path cycle while materializing {}", path.display());
     }
 
     let temporary = path.with_file_name(format!(
@@ -723,7 +738,7 @@ fn materialize_symlink_in_place(path: &Path, active_sources: &mut Vec<PathBuf>) 
     remove_path(path)?;
     fs::rename(&temporary, path).with_context(|| {
         format!(
-            "failed to replace symlink {} with materialized contents",
+            "failed to replace linked path {} with materialized contents",
             path.display()
         )
     })?;
@@ -739,13 +754,13 @@ fn copy_resolved_path(
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
 
-    if metadata.file_type().is_symlink() {
+    if is_link_like(&metadata) {
         let resolved = source
             .canonicalize()
-            .with_context(|| format!("failed to resolve nested symlink {}", source.display()))?;
+            .with_context(|| format!("failed to resolve nested linked path {}", source.display()))?;
 
         if active_sources.iter().any(|path| path == &resolved) {
-            bail!("detected a symlink cycle while materializing {}", source.display());
+            bail!("detected a linked-path cycle while materializing {}", source.display());
         }
 
         active_sources.push(resolved.clone());
@@ -810,13 +825,13 @@ fn copy_resolved_entry(
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
 
-    if metadata.file_type().is_symlink() {
+    if is_link_like(&metadata) {
         let resolved = source
             .canonicalize()
-            .with_context(|| format!("failed to resolve symlink {}", source.display()))?;
+            .with_context(|| format!("failed to resolve linked path {}", source.display()))?;
 
         if active_sources.iter().any(|path| path == &resolved) {
-            bail!("detected a symlink cycle while materializing {}", source.display());
+            bail!("detected a linked-path cycle while materializing {}", source.display());
         }
 
         active_sources.push(resolved.clone());
@@ -832,7 +847,7 @@ fn remove_path(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if metadata.file_type().is_symlink() || metadata.is_file() {
+    if is_link_like(&metadata) || metadata.is_file() {
         fs::remove_file(path)
             .with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {
@@ -846,48 +861,30 @@ fn remove_path(path: &Path) -> Result<()> {
 fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
     let server = standalone_dir.join("server.js");
     if !server.is_file() {
-        bail!(
-            "standalone output is missing server.js: {}",
-            server.display()
-        );
+        bail!("standalone output is missing server.js: {}", server.display());
     }
 
-    let next_package = standalone_dir
-        .join("node_modules")
-        .join("next")
-        .join("package.json");
+    for package in ["next", "react", "react-dom"] {
+        let package_json = standalone_dir
+            .join("node_modules")
+            .join(package)
+            .join("package.json");
 
-    if !next_package.is_file() {
-        bail!(
-            "standalone output is not self-contained: node_modules/next/package.json is missing"
-        );
-    }
-
-    let react_package = standalone_dir
-        .join("node_modules")
-        .join("react")
-        .join("package.json");
-    if !react_package.is_file() {
-        bail!(
-            "standalone output is not self-contained: node_modules/react/package.json is missing"
-        );
-    }
-
-    let react_dom_package = standalone_dir
-        .join("node_modules")
-        .join("react-dom")
-        .join("package.json");
-    if !react_dom_package.is_file() {
-        bail!(
-            "standalone output is not self-contained: node_modules/react-dom/package.json is missing"
-        );
+        if !package_json.is_file() {
+            bail!(
+                "standalone output is not self-contained: node_modules/{package}/package.json is missing"
+            );
+        }
     }
 
     for entry in WalkDir::new(standalone_dir).follow_links(false) {
         let entry = entry.context("failed while validating standalone output")?;
-        if entry.path().is_symlink() {
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+
+        if is_link_like(&metadata) {
             bail!(
-                "standalone output still contains a symlink: {}",
+                "standalone output still contains a symbolic link or Windows reparse point: {}",
                 entry.path().display()
             );
         }
