@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -261,7 +261,6 @@ fn validate_args(args: &DeployArgs) -> Result<()> {
 
 fn clone_repository(args: &DeployArgs, destination: &Path) -> Result<Repository> {
     let url = format!("https://github.com/{}/{}.git", args.git_username, args.git_repo);
-    let username = args.git_username.clone();
     let token = args.access_token.clone();
 
     let mut callbacks = RemoteCallbacks::new();
@@ -671,7 +670,7 @@ fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Resu
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(source, &metadata) {
+    if is_link_like(path, &metadata) {
         return materialize_link_like_in_place(path, active_sources);
     }
 
@@ -707,7 +706,7 @@ fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<(
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(source, &metadata) {
+    if is_link_like(path, &metadata) {
         materialize_link_like_in_place(path, active_sources)
     } else if metadata.is_dir() {
         materialize_directory(path, active_sources)
@@ -855,7 +854,7 @@ fn remove_path(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
 
-    if is_link_like(source, &metadata) {
+    if is_link_like(path, &metadata) {
         if metadata.is_dir() {
             fs::remove_dir(path)
                 .with_context(|| format!("failed to remove linked directory {}", path.display()))?;
@@ -898,7 +897,7 @@ fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(entry.path())
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
 
-        if is_link_like(source, &metadata) {
+        if is_link_like(entry.path(), &metadata) {
             bail!(
                 "standalone output still contains a symbolic link or Windows reparse point: {}",
                 entry.path().display()
