@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    io::{self},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -215,13 +215,9 @@ fn build_application(args: &DeployArgs) -> Result<(Framework, PackageManager, Pa
     install_dependencies(&context)?;
     run_build(&context)?;
 
-    let next_dir = context.project_dir.join(".next");
-    if !next_dir.is_dir() {
-        bail!("build completed but .next directory was not produced");
-    }
-
+    let standalone_dir = prepare_standalone_output(&context)?;
     let output_path = artifact_output_path(&args.build_id)?;
-    create_artifact(&context, &next_dir, &output_path)?;
+    create_artifact(&standalone_dir, &output_path)?;
 
     let size = fs::metadata(&output_path)
         .with_context(|| format!("failed to stat artifact {}", output_path.display()))?
@@ -404,11 +400,258 @@ fn run_build(context: &BuildContext) -> Result<()> {
         bail!("package.json does not define a build script");
     }
 
+    let config_override = NextConfigOverride::apply(&context.project_dir, &context.package_json)
+        .context("failed to configure Next.js standalone output")?;
+
     let executable = context.package_manager.executable();
     let args = context.package_manager.build_args();
 
-    info!(command = %format_command(executable, &args), "building application");
-    run_command(executable, &args, &context.project_dir, "application build")
+    info!(
+        command = %format_command(executable, &args),
+        "building application with standalone output enabled"
+    );
+
+    let build_result = run_command(executable, &args, &context.project_dir, "application build");
+    config_override.restore()?;
+    build_result
+}
+
+struct NextConfigOverride {
+    config_path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+impl NextConfigOverride {
+    fn apply(project_dir: &Path, package_json: &Value) -> Result<Self> {
+        let candidates = [
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.cjs",
+            "next.config.ts",
+        ];
+
+        let config_name = candidates
+            .iter()
+            .find(|candidate| project_dir.join(candidate).is_file())
+            .copied();
+
+        let (config_path, backup_path, source_name) = match config_name {
+            Some(name) => {
+                let config_path = project_dir.join(name);
+                let backup_path = project_dir.join(format!(".meshscale-original-{name}"));
+
+                if backup_path.exists() {
+                    bail!(
+                        "temporary Next.js config backup already exists: {}",
+                        backup_path.display()
+                    );
+                }
+
+                fs::rename(&config_path, &backup_path).with_context(|| {
+                    format!(
+                        "failed to temporarily move existing Next.js config {}",
+                        config_path.display()
+                    )
+                })?;
+
+                (config_path, Some(backup_path), name.to_owned())
+            }
+            None => (project_dir.join("next.config.js"), None, "next.config.js".to_owned()),
+        };
+
+        let is_esm = match source_name.as_str() {
+            "next.config.mjs" => true,
+            "next.config.cjs" => false,
+            "next.config.ts" => true,
+            "next.config.js" => package_json
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "module"),
+            _ => false,
+        };
+
+        let original_import = backup_path
+            .as_ref()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("backup filename is valid UTF-8")
+                    .to_owned()
+            });
+
+        let wrapper = if let Some(original_name) = original_import {
+            standalone_config_wrapper(&original_name, is_esm)
+        } else {
+            standalone_config_wrapper_for_new_file(is_esm)
+        };
+
+        if let Err(error) = fs::write(&config_path, wrapper) {
+            if let Some(backup_path) = &backup_path {
+                let _ = fs::remove_file(&config_path);
+                let _ = fs::rename(backup_path, &config_path);
+            }
+            return Err(error).with_context(|| {
+                format!("failed to write temporary Next.js config {}", config_path.display())
+            });
+        }
+
+        Ok(Self {
+            config_path,
+            backup_path,
+        })
+    }
+
+    fn restore(mut self) -> Result<()> {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> Result<()> {
+        if !self.config_path.exists() {
+            if let Some(backup_path) = &self.backup_path {
+                fs::rename(backup_path, &self.config_path).with_context(|| {
+                    format!(
+                        "failed to restore original Next.js config {}",
+                        self.config_path.display()
+                    )
+                })?;
+            }
+        } else {
+            fs::remove_file(&self.config_path).with_context(|| {
+                format!(
+                    "failed to remove temporary Next.js config {}",
+                    self.config_path.display()
+                )
+            })?;
+
+            if let Some(backup_path) = &self.backup_path {
+                fs::rename(backup_path, &self.config_path).with_context(|| {
+                    format!(
+                        "failed to restore original Next.js config {}",
+                        self.config_path.display()
+                    )
+                })?;
+            }
+        }
+
+        self.backup_path = None;
+        Ok(())
+    }
+}
+
+impl Drop for NextConfigOverride {
+    fn drop(&mut self) {
+        if self.backup_path.is_some() {
+            if let Err(error) = self.restore_inner() {
+                warn!(error = %error, "failed to restore original Next.js config during cleanup");
+            }
+        }
+    }
+}
+
+fn standalone_config_wrapper(original_name: &str, is_esm: bool) -> String {
+    if is_esm {
+        format!(
+            "import original from './{original_name}';
+
+const forceStandalone = (config) => ({{ ...(config || {{}}), output: 'standalone' }});
+
+export default typeof original === 'function'
+  ? (...args) => {{
+      const result = original(...args);
+      return result && typeof result.then === 'function'
+        ? result.then(forceStandalone)
+        : forceStandalone(result);
+    }}
+  : forceStandalone(original);
+"
+        )
+    } else {
+        format!(
+            "const original = require('./{original_name}');
+
+const forceStandalone = (config) => ({{ ...(config || {{}}), output: 'standalone' }});
+
+module.exports = typeof original === 'function'
+  ? (...args) => {{
+      const result = original(...args);
+      return result && typeof result.then === 'function'
+        ? result.then(forceStandalone)
+        : forceStandalone(result);
+    }}
+  : forceStandalone(original);
+"
+        )
+    }
+}
+
+fn standalone_config_wrapper_for_new_file(is_esm: bool) -> String {
+    if is_esm {
+        "export default { output: 'standalone' };\n".to_owned()
+    } else {
+        "module.exports = { output: 'standalone' };\n".to_owned()
+    }
+}
+
+fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
+    let standalone_dir = context.project_dir.join(".next").join("standalone");
+    if !standalone_dir.is_dir() {
+        bail!(
+            "build completed but Next.js standalone directory was not produced: {}",
+            standalone_dir.display()
+        );
+    }
+
+    info!("preparing self-contained Next.js standalone output");
+
+    let public_dir = context.project_dir.join("public");
+    if public_dir.is_dir() {
+        copy_directory_contents(&public_dir, &standalone_dir.join("public"))
+            .context("failed to copy public assets into standalone output")?;
+    }
+
+    let static_dir = context.project_dir.join(".next").join("static");
+    if static_dir.is_dir() {
+        copy_directory_contents(
+            &static_dir,
+            &standalone_dir.join(".next").join("static"),
+        )
+        .context("failed to copy Next.js static assets into standalone output")?;
+    }
+
+    Ok(standalone_dir)
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    for entry in WalkDir::new(source).sort_by_file_name() {
+        let entry = entry.context("failed while walking directory to copy")?;
+        let source_path = entry.path();
+        let relative = source_path
+            .strip_prefix(source)
+            .context("failed to calculate copied file path")?;
+        let destination_path = destination.join(relative);
+
+        if source_path.is_dir() {
+            fs::create_dir_all(&destination_path)
+                .with_context(|| format!("failed to create {}", destination_path.display()))?;
+        } else if source_path.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
@@ -457,51 +700,102 @@ fn artifact_output_path(build_id: &str) -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(format!("artifact-{safe_id}.zip")))
 }
 
-fn create_artifact(context: &BuildContext, next_dir: &Path, output_path: &Path) -> Result<()> {
-    let file = File::create(output_path)
-        .with_context(|| format!("failed to create artifact {}", output_path.display()))?;
+struct ZipProgress {
+    total_files: u64,
+    total_bytes: u64,
+    files_done: u64,
+    bytes_done: u64,
+    last_percent: u8,
+}
+
+fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
+    let (total_files, total_bytes) = collect_artifact_stats(standalone_dir)?;
+    info!(
+        files = total_files,
+        bytes = total_bytes,
+        "starting artifact packaging"
+    );
+
+    let temporary_output = output_path.with_extension("zip.tmp");
+    let file = File::create(&temporary_output).with_context(|| {
+        format!(
+            "failed to create temporary artifact {}",
+            temporary_output.display()
+        )
+    })?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .large_file(true);
+    let mut progress = ZipProgress {
+        total_files,
+        total_bytes,
+        files_done: 0,
+        bytes_done: 0,
+        last_percent: 0,
+    };
 
-    add_directory_to_zip(&mut zip, next_dir, next_dir, options)?;
-    add_file_to_zip(
-        &mut zip,
-        &context.project_dir.join("package.json"),
-        Path::new("package.json"),
-        options,
-    )?;
+    progress.log();
 
-    zip.finish().context("failed to finalize artifact ZIP")?;
-    Ok(())
-}
-
-fn add_directory_to_zip(
-    zip: &mut ZipWriter<File>,
-    root: &Path,
-    current: &Path,
-    options: SimpleFileOptions,
-) -> Result<()> {
-    for entry in WalkDir::new(current).sort_by_file_name() {
-        let entry = entry.context("failed while walking .next directory")?;
+    for entry in WalkDir::new(standalone_dir).sort_by_file_name() {
+        let entry = entry.context("failed while walking standalone directory")?;
         let path = entry.path();
 
         if path.is_dir() {
-            let relative = path.strip_prefix(root).context("failed to calculate artifact directory path")?;
-            let archive_path = if relative.as_os_str().is_empty() {
-                PathBuf::from(".next/")
-            } else {
-                PathBuf::from(".next").join(relative)
-            };
-            zip.add_directory(path_to_zip_name(&archive_path), options)
-                .with_context(|| format!("failed to add directory {}", path.display()))?;
+            let relative = path
+                .strip_prefix(standalone_dir)
+                .context("failed to calculate artifact directory path")?;
+
+            if !relative.as_os_str().is_empty() {
+                zip.add_directory(path_to_zip_name(relative), options)
+                    .with_context(|| format!("failed to add directory {}", path.display()))?;
+            }
         } else if path.is_file() {
-            let relative = path.strip_prefix(root).context("failed to calculate artifact file path")?;
-            add_file_to_zip(zip, path, &PathBuf::from(".next").join(relative), options)?;
+            let relative = path
+                .strip_prefix(standalone_dir)
+                .context("failed to calculate artifact file path")?;
+            add_file_to_zip(
+                &mut zip,
+                path,
+                relative,
+                options,
+                &mut progress,
+            )?;
         }
     }
+
+    zip.finish().context("failed to finalize artifact ZIP")?;
+    fs::rename(&temporary_output, output_path).with_context(|| {
+        format!(
+            "failed to move completed artifact into place: {}",
+            output_path.display()
+        )
+    })?;
+
+    info!(
+        files = progress.files_done,
+        source_bytes = progress.bytes_done,
+        "artifact packaging complete"
+    );
     Ok(())
+}
+
+fn collect_artifact_stats(root: &Path) -> Result<(u64, u64)> {
+    let mut files = 0;
+    let mut bytes = 0;
+
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry = entry.context("failed while scanning standalone output")?;
+        if entry.path().is_file() {
+            files += 1;
+            bytes += entry
+                .metadata()
+                .with_context(|| format!("failed to stat {}", entry.path().display()))?
+                .len();
+        }
+    }
+
+    Ok((files, bytes))
 }
 
 fn add_file_to_zip(
@@ -509,16 +803,73 @@ fn add_file_to_zip(
     source: &Path,
     archive_path: &Path,
     options: SimpleFileOptions,
+    progress: &mut ZipProgress,
 ) -> Result<()> {
     zip.start_file(path_to_zip_name(archive_path), options)
         .with_context(|| format!("failed to create ZIP entry {}", archive_path.display()))?;
 
     let mut input = File::open(source)
         .with_context(|| format!("failed to open artifact source {}", source.display()))?;
-    io::copy(&mut input, zip)
-        .with_context(|| format!("failed to copy {} into artifact", source.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
 
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+
+        zip.write_all(&buffer[..read])
+            .with_context(|| format!("failed to write {} into artifact", source.display()))?;
+        progress.bytes_done += read as u64;
+        progress.log();
+    }
+
+    progress.files_done += 1;
+    progress.log();
     Ok(())
+}
+
+impl ZipProgress {
+    fn log(&mut self) {
+        let percent = if self.total_bytes == 0 {
+            if self.total_files == 0 {
+                100
+            } else {
+                ((self.files_done * 100) / self.total_files).min(100) as u8
+            }
+        } else {
+            ((self.bytes_done.saturating_mul(100)) / self.total_bytes).min(100) as u8
+        };
+
+        if percent != self.last_percent || percent == 100 {
+            self.last_percent = percent;
+            info!(
+                progress = %format!("{percent}%"),
+                files = %format!("{}/{}", self.files_done, self.total_files),
+                source_bytes = %format!("{}/{}", format_bytes(self.bytes_done), format_bytes(self.total_bytes)),
+                "zipping standalone output"
+            );
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn path_to_zip_name(path: &Path) -> String {
