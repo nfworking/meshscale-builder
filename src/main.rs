@@ -554,13 +554,19 @@ fn standalone_config_wrapper(original_name: &str, is_esm: bool) -> String {
         .unwrap_or(original_name);
 
     if is_esm {
+        let typescript_annotations = if original_name.ends_with(".ts") {
+            "const original: any = importedOriginal;
+\nconst forceStandalone = (config: any): any => ({ ...(config || {}), output: 'standalone' });"
+        } else {
+            "const original = importedOriginal;
+\nconst forceStandalone = (config: any) => ({ ...(config || {}), output: 'standalone' });"
+        };
+
         format!(
-            "import original from './{import_name}';
-
-const forceStandalone = (config) => ({{ ...(config || {{}}), output: 'standalone' }});
-
-export default typeof original === 'function'
-  ? (...args) => {{
+            "import importedOriginal from './{import_name}';
+\n{typescript_annotations}
+\nexport default typeof original === 'function'
+  ? (...args: any[]) => {{
       const result = original(...args);
       return result && typeof result.then === 'function'
         ? result.then(forceStandalone)
@@ -572,11 +578,10 @@ export default typeof original === 'function'
     } else {
         format!(
             "const original = require('./{original_name}');
-
-const forceStandalone = (config) => ({{ ...(config || {{}}), output: 'standalone' }});
-
-module.exports = typeof original === 'function'
-  ? (...args) => {{
+\n
+const forceStandalone = (config: any) => ({{ ...(config || {{}}), output: 'standalone' }});
+\nmodule.exports = typeof original === 'function'
+  ? (...args: any[]) => {{
       const result = original(...args);
       return result && typeof result.then === 'function'
         ? result.then(forceStandalone)
@@ -587,7 +592,6 @@ module.exports = typeof original === 'function'
         )
     }
 }
-
 fn standalone_config_wrapper_for_new_file(is_esm: bool) -> String {
     if is_esm {
         "export default { output: 'standalone' };\n".to_owned()
