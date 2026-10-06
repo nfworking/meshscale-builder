@@ -10,9 +10,11 @@ Initial Rust prototype for the MeshScale application builder.
 4. Detect the framework from `package.json`.
 5. Detect the package manager from `packageManager` or a lockfile.
 6. Install dependencies.
-7. Run the package's `build` script.
-8. Package `.next/` and `package.json` into a ZIP artifact.
-9. Print a machine-readable JSON result containing the status, artifact path, duration, and ZIP size.
+7. Temporarily configure Next.js with `output: "standalone"` without modifying the user's committed config.
+8. Run the package's `build` script.
+9. Prepare the self-contained `.next/standalone/` output, including `public/` and `.next/static/` assets.
+10. ZIP the standalone directory as the deployment artifact, reporting file/byte progress while packaging.
+11. Print a machine-readable JSON result containing the status, artifact path, duration, and ZIP size.
 
 Docker, NATS, Trigger.dev, S3 and builder orchestration are intentionally not part of this CLI yet.
 
@@ -41,7 +43,9 @@ cargo run -- deploy \
   --build-id build_123
 ```
 
-The artifact is written to the current working directory as `artifact-<build-id>.zip`.
+The artifact is written to the current working directory as `artifact-<build-id>.zip`. The ZIP contains the contents of the Next.js standalone output at its root, so the deployment runtime does not need the original source tree or a separate `.next/` directory.
+
+During packaging, the builder logs progress such as the number of files and source bytes processed. The original Next.js configuration is restored after the build, including when the build fails.
 
 ## Framework detection
 
@@ -61,6 +65,6 @@ If no package manager metadata is present, it falls back to `npm install`.
 
 ## Security notes
 
-The current prototype accepts the GitHub PAT through `--access-token` because that is the interface being prototyped. This should be replaced with a safer secret-delivery mechanism before the CLI is used by `builderd), so the token is not exposed through process arguments.
+The current prototype accepts the GitHub PAT through `--access-token` because that is the interface being prototyped. This should be replaced with a safer secret-delivery mechanism before the CLI is used by `builderd`, so the token is not exposed through process arguments.
 
 Build execution is deliberately not sandboxed yet. Do not run this prototype against untrusted repositories outside an isolated development environment.
