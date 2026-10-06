@@ -277,7 +277,6 @@ fn clone_repository(args: &DeployArgs, destination: &Path) -> Result<Repository>
 
     let mut fetch_options = FetchOptions::new();
     fetch_options.remote_callbacks(callbacks);
-    fetch_options.depth(1);
 
     let mut builder = RepoBuilder::new();
     builder.branch(&args.git_branch);
