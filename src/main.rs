@@ -737,10 +737,7 @@ fn materialize_link_like_in_place(path: &Path, active_sources: &mut Vec<PathBuf>
         remove_path(&temporary)?;
     }
 
-    active_sources.push(resolved.clone());
-    let result = copy_resolved_path(&resolved, &temporary, active_sources);
-    active_sources.pop();
-    result?;
+    copy_resolved_path(&resolved, &temporary, active_sources)?;
 
     remove_path(path)?;
     fs::rename(&temporary, path).with_context(|| {
@@ -770,10 +767,7 @@ fn copy_resolved_path(
             bail!("detected a linked-path cycle while materializing {}", source.display());
         }
 
-        active_sources.push(resolved.clone());
-        let result = copy_resolved_path(&resolved, destination, active_sources);
-        active_sources.pop();
-        return result;
+        return copy_resolved_path(&resolved, destination, active_sources);
     }
 
     if metadata.is_dir() {
