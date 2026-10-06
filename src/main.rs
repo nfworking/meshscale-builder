@@ -266,12 +266,16 @@ fn clone_repository(args: &DeployArgs, destination: &Path) -> Result<Repository>
     let token = args.access_token.clone();
 
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |_url, username_from_url, allowed_types| {
+    callbacks.credentials(move |_url, _username_from_url, allowed_types| {
         if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            let login = username_from_url.unwrap_or(&username);
-            Cred::userpass_plaintext(login, &token)
+            // GitHub accepts a PAT as the password for HTTPS authentication.
+            // Use the conventional x-access-token username instead of depending
+            // on the username returned by the remote.
+            Cred::userpass_plaintext("x-access-token", &token)
         } else {
-            Err(git2::Error::from_str("GitHub token authentication is unavailable"))
+            Err(git2::Error::from_str(
+                "GitHub HTTPS authentication requires USER_PASS_PLAINTEXT credentials",
+            ))
         }
     });
 
@@ -282,9 +286,16 @@ fn clone_repository(args: &DeployArgs, destination: &Path) -> Result<Repository>
     builder.branch(&args.git_branch);
     builder.fetch_options(fetch_options);
 
-    builder
-        .clone(&url, destination)
-        .with_context(|| format!("failed to clone GitHub repository {}/{}", args.git_username, args.git_repo))
+    builder.clone(&url, destination).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to clone GitHub repository {}/{}: {} (class: {:?}, code: {:?})",
+            args.git_username,
+            args.git_repo,
+            error.message(),
+            error.class(),
+            error.code()
+        )
+    })
 }
 
 fn checkout_commit(repo_dir: &Path, commit_sha: &str) -> Result<()> {
