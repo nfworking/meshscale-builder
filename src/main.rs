@@ -855,6 +855,16 @@ fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
         );
     }
 
+    for entry in WalkDir::new(standalone_dir).follow_links(false) {
+        let entry = entry.context("failed while validating standalone output")?;
+        if entry.path().is_symlink() {
+            bail!(
+                "standalone output still contains a symlink: {}",
+                entry.path().display()
+            );
+        }
+    }
+
     info!("validated self-contained standalone runtime");
     Ok(())
 }
