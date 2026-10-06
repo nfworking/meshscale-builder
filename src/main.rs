@@ -695,7 +695,7 @@ fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(entry.path())
             .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
 
-        if is_link_like(entry.path(), &metadata) {
+        if metadata.file_type().is_symlink() || fs::read_link(entry.path()).is_ok() {
             bail!(
                 "standalone output still contains a symbolic link or Windows reparse point: {}",
                 entry.path().display()
