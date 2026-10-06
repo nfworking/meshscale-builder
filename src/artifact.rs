@@ -1,10 +1,9 @@
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 use tracing::info;
 use walkdir::WalkDir;
@@ -65,7 +64,7 @@ pub fn create_output(
 
     info!(files = all_traced_files.len(), "collected runtime trace");
 
-    copy_runtime_files(&project_root, &runtime_dir, &all_traced_files)?;
+    copy_runtime_files(&runtime_dir, &all_traced_files)?;
     copy_next_runtime(project_dir, &runtime_dir)?;
     copy_required_runtime_files(project_dir, &runtime_dir)?;
     copy_public_assets(project_dir, &static_dir)?;
@@ -103,8 +102,8 @@ pub fn create_output(
     Ok(output_dir)
 }
 
-fn collect_next_trace_files(next_dir: &Path, project_root: &Path) -> Result<BTreeSet<String>> {
-    let mut files = BTreeSet::new();
+fn collect_next_trace_files(next_dir: &Path, project_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let mut files = BTreeMap::new();
 
     for entry in WalkDir::new(next_dir)
         .follow_links(false)
@@ -142,58 +141,109 @@ fn collect_next_trace_files(next_dir: &Path, project_root: &Path) -> Result<BTre
             let relative = trace_file
                 .as_str()
                 .context("Next.js NFT trace contains a non-string path")?;
-            let resolved = trace_root.join(relative).canonicalize().with_context(|| {
-                format!(
-                    "failed to resolve traced file {} from {}",
-                    relative,
-                    path.display()
-                )
-            })?;
+            let (logical_path, resolved) =
+                resolve_trace_file(project_root, trace_root, relative).with_context(|| {
+                    format!(
+                        "failed to resolve traced file {} from {}",
+                        relative,
+                        path.display()
+                    )
+                })?;
 
-            files.insert(relative_project_path(project_root, &resolved)?);
+            if let Some(existing) = files.insert(logical_path.clone(), resolved.clone()) {
+                if existing != resolved {
+                    bail!(
+                        "Next.js NFT trace maps {} to multiple files: {} and {}",
+                        logical_path,
+                        existing.display(),
+                        resolved.display()
+                    );
+                }
+            }
         }
     }
 
     Ok(files)
 }
 
-fn relative_project_path(project_root: &Path, path: &Path) -> Result<String> {
-    let relative = path.strip_prefix(project_root).with_context(|| {
+fn resolve_trace_file(
+    project_root: &Path,
+    trace_root: &Path,
+    relative: &str,
+) -> Result<(String, PathBuf)> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute() {
+        bail!("NFT trace contains an absolute path: {}", relative);
+    }
+
+    let trace_root = trace_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize trace root {}", trace_root.display()))?;
+
+    let trace_root_relative = trace_root.strip_prefix(project_root).with_context(|| {
         format!(
-            "NFT trace points outside the build project root: {}",
-            path.display()
+            "NFT trace root is outside the build project root: {}",
+            trace_root.display()
         )
     })?;
 
-    if relative.components().any(|component| {
-        matches!(component, std::path::Component::ParentDir)
-    }) {
-        bail!("NFT trace produced a parent-directory path: {}", path.display());
+    let mut logical_components = trace_root_relative.components().collect::<Vec<_>>();
+
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => {
+                logical_components.push(std::path::Component::Normal(value));
+            }
+            std::path::Component::ParentDir => {
+                if logical_components.pop().is_none() {
+                    bail!("NFT trace escapes the build project root: {}", relative);
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("NFT trace contains an invalid path: {}", relative);
+            }
+        }
     }
 
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    let logical_path = logical_components
+        .iter()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let resolved = trace_root.join(relative).canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize traced file {} from {}",
+            relative,
+            trace_root.display()
+        )
+    })?;
+
+    if !resolved.starts_with(project_root) {
+        bail!(
+            "NFT trace points outside the build project root: {}",
+            resolved.display()
+        );
+    }
+
+    Ok((logical_path, resolved))
 }
 
-fn copy_runtime_files(project_root: &Path, runtime_dir: &Path, files: &BTreeSet<String>) -> Result<()> {
-    for relative in files {
-        let source = project_root.join(relative);
+fn copy_runtime_files(
+    runtime_dir: &Path,
+    files: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    for (relative, source) in files {
         let destination = runtime_dir.join(relative);
-
-        let metadata = fs::symlink_metadata(&source)
+        let metadata = fs::metadata(source)
             .with_context(|| format!("failed to inspect traced file {}", source.display()))?;
 
-        if metadata.file_type().is_symlink() || fs::read_link(&source).is_ok() {
+        if !metadata.is_file() {
             bail!(
-                "NFT trace contains a symbolic link or Windows junction; relocatable output requires a real file: {}",
+                "NFT trace contains unsupported filesystem entry: {}",
                 source.display()
             );
-        }
-
-        if metadata.is_dir() {
-            continue;
-        }
-        if !metadata.is_file() {
-            bail!("NFT trace contains unsupported filesystem entry: {}", source.display());
         }
 
         if let Some(parent) = destination.parent() {
@@ -201,7 +251,7 @@ fn copy_runtime_files(project_root: &Path, runtime_dir: &Path, files: &BTreeSet<
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        fs::copy(&source, &destination).with_context(|| {
+        fs::copy(source, &destination).with_context(|| {
             format!(
                 "failed to copy traced runtime file {} to {}",
                 source.display(),
