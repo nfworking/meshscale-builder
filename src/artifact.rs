@@ -11,8 +11,6 @@ use walkdir::WalkDir;
 
 use crate::BuildMetadata;
 
-const TRACE_HELPER: &str = "scripts/trace-runtime.cjs";
-
 pub fn create_output(
     project_dir: &Path,
     metadata: &BuildMetadata,
@@ -63,11 +61,7 @@ pub fn create_output(
     fs::create_dir_all(&static_dir)
         .with_context(|| format!("failed to create {}", static_dir.display()))?;
 
-    let traced_files = run_runtime_trace(&project_root, &next_package_json)?;
-    let next_trace_files = collect_next_trace_files(&next_dir, &project_root)?;
-    let mut all_traced_files = BTreeSet::new();
-    all_traced_files.extend(traced_files);
-    all_traced_files.extend(next_trace_files);
+    let all_traced_files = collect_next_trace_files(&next_dir, &project_root)?;
 
     info!(files = all_traced_files.len(), "collected runtime trace");
 
@@ -107,65 +101,6 @@ pub fn create_output(
     validate_output(&output_dir)?;
 
     Ok(output_dir)
-}
-
-fn run_runtime_trace(project_root: &Path, next_package_json: &Path) -> Result<BTreeSet<String>> {
-    let helper = locate_trace_helper()?;
-
-    let output = Command::new(node_executable())
-        .arg(&helper)
-        .arg(project_root)
-        .arg(next_package_json)
-        .current_dir(project_root)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("failed to start Node NFT helper {}", helper.display()))?;
-
-    if !output.status.success() {
-        bail!(
-            "Node NFT helper failed with exit status {}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "terminated by signal".to_owned(), |code| code.to_string())
-        );
-    }
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("NFT helper returned invalid JSON")?;
-
-    let files = value
-        .get("files")
-        .and_then(serde_json::Value::as_array)
-        .context("NFT helper response is missing a files array")?;
-
-    files
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .context("NFT helper returned a non-string file path")
-        })
-        .collect()
-}
-
-fn locate_trace_helper() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let helper = manifest_dir.join(TRACE_HELPER);
-    if !helper.is_file() {
-        bail!("NFT helper is missing from the builder repository: {}", helper.display());
-    }
-    Ok(helper)
-}
-
-fn node_executable() -> &'static str {
-    if cfg!(windows) {
-        "node.exe"
-    } else {
-        "node"
-    }
 }
 
 fn collect_next_trace_files(next_dir: &Path, project_root: &Path) -> Result<BTreeSet<String>> {
