@@ -29,8 +29,8 @@ if (!fs.existsSync(absoluteEntrypoint)) {
 
 let nodeFileTrace;
 try {
-  const requireFromProject = createRequire(path.join(absoluteProjectRoot, "package.json"));
-  ({ nodeFileTrace } = requireFromProject("@vercel/nft"));
+  const requireFromNext = createRequire(absoluteEntrypoint);
+  ({ nodeFileTrace } = requireFromNext("@vercel/nft"));
 } catch (error) {
   fail(
     "unable to load @vercel/nft from the built project's dependency tree. " +
