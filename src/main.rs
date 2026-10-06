@@ -4,6 +4,7 @@ use git2::{build::RepoBuilder, Cred, CredentialType, FetchOptions, Oid, RemoteCa
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -658,20 +659,7 @@ fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
         }
     }
 
-    for entry in WalkDir::new(standalone_dir).follow_links(false) {
-        let entry = entry.context("failed while validating standalone output")?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-
-        if metadata.file_type().is_symlink() || fs::read_link(entry.path()).is_ok() {
-            bail!(
-                "standalone output still contains a symbolic link or Windows reparse point: {}",
-                entry.path().display()
-            );
-        }
-    }
-
-    info!("validated self-contained standalone runtime");
+    info!("validated standalone runtime layout; dependency links will be materialized during packaging");
     Ok(())
 }
 
@@ -791,32 +779,16 @@ fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
 
     progress.log();
 
-    for entry in WalkDir::new(standalone_dir).sort_by_file_name() {
-        let entry = entry.context("failed while walking standalone directory")?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let relative = path
-                .strip_prefix(standalone_dir)
-                .context("failed to calculate artifact directory path")?;
-
-            if !relative.as_os_str().is_empty() {
-                zip.add_directory(path_to_zip_name(relative), options)
-                    .with_context(|| format!("failed to add directory {}", path.display()))?;
-            }
-        } else if path.is_file() {
-            let relative = path
-                .strip_prefix(standalone_dir)
-                .context("failed to calculate artifact file path")?;
-            add_file_to_zip(
-                &mut zip,
-                path,
-                relative,
-                options,
-                &mut progress,
-            )?;
-        }
-    }
+    let mut active_targets = HashSet::new();
+    package_directory_into_zip(
+        standalone_dir,
+        Path::new(""),
+        standalone_dir,
+        options,
+        &mut zip,
+        &mut progress,
+        &mut active_targets,
+    )?;
 
     zip.finish().context("failed to finalize artifact ZIP")?;
     fs::rename(&temporary_output, output_path).with_context(|| {
@@ -831,6 +803,133 @@ fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
         source_bytes = progress.bytes_done,
         "artifact packaging complete"
     );
+    Ok(())
+}
+
+fn package_directory_into_zip(
+    source_dir: &Path,
+    archive_dir: &Path,
+    root: &Path,
+    options: SimpleFileOptions,
+    zip: &mut ZipWriter<File>,
+    progress: &mut ZipProgress,
+    active_targets: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let canonical_source = source_dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", source_dir.display()))?;
+
+    if !canonical_source.starts_with(root.canonicalize().context("failed to resolve standalone root")?) {
+        bail!(
+            "standalone dependency link resolves outside the artifact root: {}",
+            source_dir.display()
+        );
+    }
+
+    if !active_targets.insert(canonical_source.clone()) {
+        bail!(
+            "standalone dependency link cycle detected at {}",
+            source_dir.display()
+        );
+    }
+
+    let mut entries = fs::read_dir(source_dir)
+        .with_context(|| format!("failed to read standalone directory {}", source_dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to enumerate {}", source_dir.display()))?;
+
+    entries.sort_by_key(|entry| entry.file_name());
+
+    if !archive_dir.as_os_str().is_empty() {
+        zip.add_directory(path_to_zip_name(archive_dir), options)
+            .with_context(|| format!("failed to add directory {}", archive_dir.display()))?;
+    }
+
+    for entry in entries {
+        let source_path = entry.path();
+        let archive_path = archive_dir.join(entry.file_name());
+        package_path_into_zip(
+            &source_path,
+            &archive_path,
+            root,
+            options,
+            zip,
+            progress,
+            active_targets,
+        )?;
+    }
+
+    active_targets.remove(&canonical_source);
+    Ok(())
+}
+
+fn package_path_into_zip(
+    source_path: &Path,
+    archive_path: &Path,
+    root: &Path,
+    options: SimpleFileOptions,
+    zip: &mut ZipWriter<File>,
+    progress: &mut ZipProgress,
+    active_targets: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source_path)
+        .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+
+    let is_link_like = metadata.file_type().is_symlink() || fs::read_link(source_path).is_ok();
+
+    if is_link_like {
+        let target = source_path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve dependency link {}", source_path.display()))?;
+
+        let canonical_root = root
+            .canonicalize()
+            .context("failed to resolve standalone root")?;
+
+        if !target.starts_with(&canonical_root) {
+            bail!(
+                "standalone dependency link resolves outside the artifact root: {} -> {}",
+                source_path.display(),
+                target.display()
+            );
+        }
+
+        if target.is_dir() {
+            package_directory_into_zip(
+                &target,
+                archive_path,
+                root,
+                options,
+                zip,
+                progress,
+                active_targets,
+            )?;
+        } else if target.is_file() {
+            add_file_to_zip(zip, &target, archive_path, options, progress)?;
+        } else {
+            bail!(
+                "standalone dependency link target is neither a file nor directory: {}",
+                target.display()
+            );
+        }
+
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        package_directory_into_zip(
+            source_path,
+            archive_path,
+            root,
+            options,
+            zip,
+            progress,
+            active_targets,
+        )?;
+    } else if metadata.is_file() {
+        add_file_to_zip(zip, source_path, archive_path, options, progress)?;
+    }
+
     Ok(())
 }
 
