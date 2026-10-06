@@ -109,6 +109,7 @@ fn collect_next_trace_files(next_dir: &Path, project_root: &Path) -> Result<BTre
     for entry in WalkDir::new(next_dir)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| !is_generated_standalone_tree(entry.path(), next_dir))
         .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
@@ -215,7 +216,33 @@ fn copy_runtime_files(project_root: &Path, runtime_dir: &Path, files: &BTreeSet<
 fn copy_next_runtime(project_dir: &Path, runtime_dir: &Path) -> Result<()> {
     let source = project_dir.join(".next");
     let destination = runtime_dir.join(".next");
-    copy_tree_excluding_cache(&source, &destination)
+    copy_tree_excluding_generated(&source, &destination)
+}
+
+fn is_generated_standalone_tree(path: &Path, next_dir: &Path) -> bool {
+    path.strip_prefix(next_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| component.as_os_str() == "standalone")
+}
+
+fn copy_tree_excluding_generated(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    let walker = WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.path().file_name().and_then(|name| name.to_str());
+            name != Some("cache") && name != Some("standalone")
+        });
+
+    for entry in walker.filter_map(std::result::Result::ok) {
+        copy_entry(source, destination, entry.path())?;
+    }
+
+    Ok(())
 }
 
 fn copy_required_runtime_files(project_dir: &Path, runtime_dir: &Path) -> Result<()> {
@@ -249,24 +276,6 @@ fn copy_next_static(project_dir: &Path, static_dir: &Path) -> Result<()> {
     if next_static.is_dir() {
         copy_directory_contents(&next_static, &static_dir.join("_next").join("static"))?;
     }
-    Ok(())
-}
-
-fn copy_tree_excluding_cache(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-
-    let walker = WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry.path().file_name().and_then(|name| name.to_str()) != Some("cache")
-        });
-
-    for entry in walker.filter_map(std::result::Result::ok) {
-        copy_entry(source, destination, entry.path())?;
-    }
-
     Ok(())
 }
 
