@@ -41,20 +41,19 @@ try {
 }
 
 const nextPackage = JSON.parse(fs.readFileSync(absoluteEntrypoint, "utf8"));
-const serverEntrypoint = path.join(
-  path.dirname(absoluteEntrypoint),
-  "dist",
-  "server",
-  "next-server.js",
-);
+const nextRoot = path.dirname(absoluteEntrypoint);
+const serverEntrypoint = path.join(nextRoot, "dist", "server", "next-server.js");
+const cliEntrypoint = path.join(nextRoot, "dist", "bin", "next");
 
-if (!fs.existsSync(serverEntrypoint)) {
-  fail(`Next.js production server entrypoint does not exist: ${serverEntrypoint}`);
+for (const entry of [serverEntrypoint, cliEntrypoint]) {
+  if (!fs.existsSync(entry)) {
+    fail(`Next.js runtime entrypoint does not exist: ${entry}`);
+  }
 }
 
 (async () => {
   try {
-    const result = await nodeFileTrace([serverEntrypoint], {
+    const result = await nodeFileTrace([serverEntrypoint, cliEntrypoint], {
       base: absoluteProjectRoot,
       processCwd: absoluteProjectRoot,
       ts: true,

@@ -72,24 +72,10 @@ pub fn create_output(
     info!(files = all_traced_files.len(), "collected runtime trace");
 
     copy_runtime_files(&project_root, &runtime_dir, &all_traced_files)?;
+    copy_next_runtime(project_dir, &runtime_dir)?;
     copy_required_runtime_files(project_dir, &runtime_dir)?;
     copy_public_assets(project_dir, &static_dir)?;
     copy_next_static(project_dir, &static_dir)?;
-
-    let runtime_package = json!({
-        "name": format!("meshscale-runtime-{}", metadata.build_id),
-        "private": true,
-        "type": "module",
-        "dependencies": {
-            "next": metadata.next_version()
-        }
-    });
-
-    fs::write(
-        runtime_dir.join("package.json"),
-        serde_json::to_vec_pretty(&runtime_package).context("failed to serialize runtime package.json")?,
-    )
-    .context("failed to write runtime package.json")?;
 
     let manifest = json!({
         "version": metadata.version,
@@ -290,6 +276,12 @@ fn copy_runtime_files(project_root: &Path, runtime_dir: &Path, files: &BTreeSet<
     Ok(())
 }
 
+fn copy_next_runtime(project_dir: &Path, runtime_dir: &Path) -> Result<()> {
+    let source = project_dir.join(".next");
+    let destination = runtime_dir.join(".next");
+    copy_tree_excluding_cache(&source, &destination)
+}
+
 fn copy_required_runtime_files(project_dir: &Path, runtime_dir: &Path) -> Result<()> {
     for name in [
         "package.json",
@@ -324,6 +316,24 @@ fn copy_next_static(project_dir: &Path, static_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_tree_excluding_cache(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    let walker = WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.path().file_name().and_then(|name| name.to_str()) != Some("cache")
+        });
+
+    for entry in walker.filter_map(std::result::Result::ok) {
+        copy_entry(source, destination, entry.path())?;
+    }
+
+    Ok(())
+}
+
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
@@ -333,38 +343,31 @@ fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
         .into_iter()
         .filter_map(std::result::Result::ok)
     {
-        let source_path = entry.path();
-        let relative = source_path
-            .strip_prefix(source)
-            .context("failed to calculate copied asset path")?;
-        let destination_path = destination.join(relative);
+        copy_entry(source, destination, entry.path())?;
+    }
 
-        let metadata = fs::symlink_metadata(source_path)
-            .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+    Ok(())
+}
 
-        if metadata.file_type().is_symlink() || fs::read_link(source_path).is_ok() {
-            bail!(
-                "static output contains a symbolic link or Windows junction: {}",
-                source_path.display()
-            );
+fn copy_entry(source: &Path, destination: &Path, source_path: &Path) -> Result<()> {
+    let relative = source_path
+        .strip_prefix(source)
+        .context("failed to calculate copied path")?;
+    let destination_path = destination.join(relative);
+    let metadata = fs::symlink_metadata(source_path)
+        .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+
+    if metadata.file_type().is_symlink() || fs::read_link(source_path).is_ok() {
+        bail!("output contains a symbolic link or Windows junction: {}", source_path.display());
+    }
+
+    if metadata.is_dir() {
+        fs::create_dir_all(&destination_path)?;
+    } else if metadata.is_file() {
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)?;
         }
-
-        if metadata.is_dir() {
-            fs::create_dir_all(&destination_path)
-                .with_context(|| format!("failed to create {}", destination_path.display()))?;
-        } else if metadata.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-            fs::copy(source_path, &destination_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source_path.display(),
-                    destination_path.display()
-                )
-            })?;
-        }
+        fs::copy(source_path, &destination_path)?;
     }
 
     Ok(())
