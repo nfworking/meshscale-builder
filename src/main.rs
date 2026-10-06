@@ -216,6 +216,9 @@ fn build_application(args: &DeployArgs) -> Result<(Framework, PackageManager, Pa
     run_build(&context)?;
 
     let standalone_dir = prepare_standalone_output(&context)?;
+    materialize_standalone_output(&standalone_dir)
+        .context("failed to materialize standalone runtime dependencies")?;
+    validate_standalone_output(&standalone_dir)?;
     let output_path = artifact_output_path(&args.build_id)?;
     create_artifact(&standalone_dir, &output_path)?;
 
@@ -627,6 +630,163 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
     }
 
     Ok(standalone_dir)
+}
+
+
+fn materialize_standalone_output(standalone_dir: &Path) -> Result<()> {
+    let mut active_sources = Vec::new();
+    materialize_path(standalone_dir, standalone_dir, &mut active_sources, true)
+        .context("failed to materialize symlinked files in standalone output")?;
+
+    info!("standalone runtime dependencies materialized");
+    Ok(())
+}
+
+fn materialize_path(
+    source: &Path,
+    destination: &Path,
+    active_sources: &mut Vec<PathBuf>,
+    preserve_root: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect {}", source.display()))?;
+
+    if metadata.file_type().is_symlink() {
+        let resolved = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve symlink {}", source.display()))?;
+
+        if active_sources.iter().any(|path| path == &resolved) {
+            bail!(
+                "detected a symlink cycle while materializing {}",
+                source.display()
+            );
+        }
+
+        if destination.exists() || destination.is_symlink() {
+            remove_path(destination)?;
+        }
+
+        active_sources.push(resolved.clone());
+        let result = materialize_path(&resolved, destination, active_sources, false);
+        active_sources.pop();
+        return result;
+    }
+
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("failed to create {}", destination.display()))?;
+
+        active_sources.push(
+            source
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", source.display()))?,
+        );
+
+        let result = (|| -> Result<()> {
+            for entry in fs::read_dir(source)
+                .with_context(|| format!("failed to read {}", source.display()))?
+            {
+                let entry = entry
+                    .with_context(|| format!("failed to read an entry in {}", source.display()))?;
+                let child_source = entry.path();
+                let child_destination = destination.join(entry.file_name());
+
+                if preserve_root && child_source.file_name().is_some_and(|name| name == ".next") {
+                    // Keep the standalone .next tree intact; only its symlinks are
+                    // materialized by the recursive call.
+                }
+
+                materialize_path(
+                    &child_source,
+                    &child_destination,
+                    active_sources,
+                    false,
+                )?;
+            }
+            Ok(())
+        })();
+
+        active_sources.pop();
+        return result;
+    }
+
+    if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        fs::copy(source, destination).with_context(|| {
+            format!(
+                "failed to materialize {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    bail!("unsupported filesystem entry in standalone output: {}", source.display())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
+    let server = standalone_dir.join("server.js");
+    if !server.is_file() {
+        bail!(
+            "standalone output is missing server.js: {}",
+            server.display()
+        );
+    }
+
+    let next_package = standalone_dir
+        .join("node_modules")
+        .join("next")
+        .join("package.json");
+
+    if !next_package.is_file() {
+        bail!(
+            "standalone output is not self-contained: node_modules/next/package.json is missing"
+        );
+    }
+
+    let react_package = standalone_dir
+        .join("node_modules")
+        .join("react")
+        .join("package.json");
+    if !react_package.is_file() {
+        bail!(
+            "standalone output is not self-contained: node_modules/react/package.json is missing"
+        );
+    }
+
+    let react_dom_package = standalone_dir
+        .join("node_modules")
+        .join("react-dom")
+        .join("package.json");
+    if !react_dom_package.is_file() {
+        bail!(
+            "standalone output is not self-contained: node_modules/react-dom/package.json is missing"
+        );
+    }
+
+    info!("validated self-contained standalone runtime");
+    Ok(())
 }
 
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
