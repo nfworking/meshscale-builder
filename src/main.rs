@@ -635,77 +635,103 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
 
 fn materialize_standalone_output(standalone_dir: &Path) -> Result<()> {
     let mut active_sources = Vec::new();
-    materialize_path(standalone_dir, &mut active_sources)
-        .context("failed to materialize symlinked files in standalone output")?;
+    materialize_directory(standalone_dir, &mut active_sources)
+        .context("failed to materialize standalone runtime dependencies")?;
 
     info!("standalone runtime dependencies materialized");
     Ok(())
 }
 
-fn materialize_path(source: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect {}", source.display()))?;
+fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
 
     if metadata.file_type().is_symlink() {
-        let resolved = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve symlink {}", source.display()))?;
-
-        if active_sources.iter().any(|path| path == &resolved) {
-            bail!(
-                "detected a symlink cycle while materializing {}",
-                source.display()
-            );
-        }
-
-        remove_path(source)?;
-
-        active_sources.push(resolved.clone());
-        let result = materialize_resolved_path(&resolved, source, active_sources);
-        active_sources.pop();
-        return result;
+        return materialize_symlink_in_place(path, active_sources);
     }
 
-    if metadata.is_dir() {
-        let canonical_source = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve {}", source.display()))?;
-
-        if active_sources.iter().any(|path| path == &canonical_source) {
-            bail!(
-                "detected a directory cycle while materializing {}",
-                source.display()
-            );
-        }
-
-        active_sources.push(canonical_source);
-
-        let result = (|| -> Result<()> {
-            for entry in fs::read_dir(source)
-                .with_context(|| format!("failed to read {}", source.display()))?
-            {
-                let entry = entry
-                    .with_context(|| format!("failed to read an entry in {}", source.display()))?;
-                materialize_path(&entry.path(), active_sources)?;
-            }
-            Ok(())
-        })();
-
-        active_sources.pop();
-        return result;
-    }
-
-    if metadata.is_file() {
+    if !metadata.is_dir() {
         return Ok(());
     }
 
-    bail!(
-        "unsupported filesystem entry in standalone output: {}",
-        source.display()
-    )
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+
+    if active_sources.iter().any(|source| source == &canonical) {
+        bail!("detected a directory cycle while materializing {}", path.display());
+    }
+
+    active_sources.push(canonical);
+    let result = (|| -> Result<()> {
+        let entries = fs::read_dir(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to read an entry in {}", path.display()))?;
+            materialize_entry(&entry.path(), active_sources)?;
+        }
+
+        Ok(())
+    })();
+    active_sources.pop();
+
+    result
 }
 
-fn materialize_resolved_path(
+fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+    if metadata.file_type().is_symlink() {
+        materialize_symlink_in_place(path, active_sources)
+    } else if metadata.is_dir() {
+        materialize_directory(path, active_sources)
+    } else if metadata.is_file() {
+        Ok(())
+    } else {
+        bail!("unsupported filesystem entry in standalone output: {}", path.display())
+    }
+}
+
+fn materialize_symlink_in_place(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve symlink {}", path.display()))?;
+
+    if active_sources.iter().any(|source| source == &resolved) {
+        bail!("detected a symlink cycle while materializing {}", path.display());
+    }
+
+    let temporary = path.with_file_name(format!(
+        ".meshscale-materialize-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("entry")
+    ));
+
+    if temporary.exists() || temporary.is_symlink() {
+        remove_path(&temporary)?;
+    }
+
+    active_sources.push(resolved.clone());
+    let result = copy_resolved_path(&resolved, &temporary, active_sources);
+    active_sources.pop();
+    result?;
+
+    remove_path(path)?;
+    fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "failed to replace symlink {} with materialized contents",
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn copy_resolved_path(
     source: &Path,
     destination: &Path,
     active_sources: &mut Vec<PathBuf>,
@@ -714,28 +740,33 @@ fn materialize_resolved_path(
         .with_context(|| format!("failed to inspect {}", source.display()))?;
 
     if metadata.file_type().is_symlink() {
-        return materialize_path(source, active_sources).and_then(|_| {
-            fs::copy(source, destination).with_context(|| {
-                format!(
-                    "failed to materialize {} to {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-            Ok(())
-        });
+        let resolved = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve nested symlink {}", source.display()))?;
+
+        if active_sources.iter().any(|path| path == &resolved) {
+            bail!("detected a symlink cycle while materializing {}", source.display());
+        }
+
+        active_sources.push(resolved.clone());
+        let result = copy_resolved_path(&resolved, destination, active_sources);
+        active_sources.pop();
+        return result;
     }
 
     if metadata.is_dir() {
+        let canonical = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", source.display()))?;
+
+        if active_sources.iter().any(|path| path == &canonical) {
+            bail!("detected a directory cycle while materializing {}", source.display());
+        }
+
         fs::create_dir_all(destination)
             .with_context(|| format!("failed to create {}", destination.display()))?;
 
-        active_sources.push(
-            source
-                .canonicalize()
-                .with_context(|| format!("failed to resolve {}", source.display()))?,
-        );
-
+        active_sources.push(canonical);
         let result = (|| -> Result<()> {
             for entry in fs::read_dir(source)
                 .with_context(|| format!("failed to read {}", source.display()))?
@@ -743,12 +774,12 @@ fn materialize_resolved_path(
                 let entry = entry
                     .with_context(|| format!("failed to read an entry in {}", source.display()))?;
                 let child_destination = destination.join(entry.file_name());
-                materialize_resolved_entry(&entry.path(), &child_destination, active_sources)?;
+                copy_resolved_entry(&entry.path(), &child_destination, active_sources)?;
             }
             Ok(())
         })();
-
         active_sources.pop();
+
         return result;
     }
 
@@ -771,7 +802,7 @@ fn materialize_resolved_path(
     bail!("unsupported filesystem entry: {}", source.display())
 }
 
-fn materialize_resolved_entry(
+fn copy_resolved_entry(
     source: &Path,
     destination: &Path,
     active_sources: &mut Vec<PathBuf>,
@@ -785,19 +816,16 @@ fn materialize_resolved_entry(
             .with_context(|| format!("failed to resolve symlink {}", source.display()))?;
 
         if active_sources.iter().any(|path| path == &resolved) {
-            bail!(
-                "detected a symlink cycle while materializing {}",
-                source.display()
-            );
+            bail!("detected a symlink cycle while materializing {}", source.display());
         }
 
         active_sources.push(resolved.clone());
-        let result = materialize_resolved_path(&resolved, destination, active_sources);
+        let result = copy_resolved_path(&resolved, destination, active_sources);
         active_sources.pop();
         return result;
     }
 
-    materialize_resolved_path(source, destination, active_sources)
+    copy_resolved_path(source, destination, active_sources)
 }
 
 fn remove_path(path: &Path) -> Result<()> {
