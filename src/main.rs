@@ -751,7 +751,24 @@ struct ZipProgress {
 }
 
 fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
-    let (total_files, total_bytes) = collect_artifact_stats(standalone_dir)?;
+    let staging = TempDir::new().context("failed to create artifact staging directory")?;
+    let materialized_dir = staging.path().join("standalone");
+
+    info!("materializing standalone runtime into a relocatable artifact tree");
+    let mut active_targets = HashSet::new();
+    materialize_directory(
+        standalone_dir,
+        &materialized_dir,
+        standalone_dir,
+        &mut active_targets,
+    )?;
+
+    // The staging tree is deliberately a normal filesystem tree: all symbolic
+    // links and Windows junctions have been resolved to their actual contents.
+    // This is important because Next.js documents that a Windows junction in
+    // standalone output can contain an absolute target and therefore is not
+    // relocatable when deployed elsewhere.
+    let (total_files, total_bytes) = collect_artifact_stats(&materialized_dir)?;
     info!(
         files = total_files,
         bytes = total_bytes,
@@ -779,16 +796,34 @@ fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
 
     progress.log();
 
-    let mut active_targets = HashSet::new();
-    package_directory_into_zip(
-        standalone_dir,
-        Path::new(""),
-        standalone_dir,
-        options,
-        &mut zip,
-        &mut progress,
-        &mut active_targets,
-    )?;
+    for entry in WalkDir::new(&materialized_dir)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(&materialized_dir)
+            .context("failed to calculate artifact archive path")?;
+
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let archive_path = path_to_zip_name(relative);
+
+        if entry.file_type().is_dir() {
+            zip.add_directory(format!("{archive_path}/"), options)
+                .with_context(|| format!("failed to add directory {archive_path}"))?;
+        } else if entry.file_type().is_file() {
+            add_file_to_zip(&mut zip, path, relative, options, &mut progress)?;
+        } else {
+            bail!(
+                "materialized artifact contains an unsupported filesystem entry: {}",
+                path.display()
+            );
+        }
+    }
 
     zip.finish().context("failed to finalize artifact ZIP")?;
     fs::rename(&temporary_output, output_path).with_context(|| {
@@ -806,20 +841,20 @@ fn create_artifact(standalone_dir: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn package_directory_into_zip(
+fn materialize_directory(
     source_dir: &Path,
-    archive_dir: &Path,
+    destination_dir: &Path,
     root: &Path,
-    options: SimpleFileOptions,
-    zip: &mut ZipWriter<File>,
-    progress: &mut ZipProgress,
     active_targets: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let canonical_source = source_dir
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", source_dir.display()))?;
+    let canonical_root = root
+        .canonicalize()
+        .context("failed to resolve standalone root")?;
 
-    if !canonical_source.starts_with(root.canonicalize().context("failed to resolve standalone root")?) {
+    if !canonical_source.starts_with(&canonical_root) {
         bail!(
             "standalone dependency link resolves outside the artifact root: {}",
             source_dir.display()
@@ -833,6 +868,9 @@ fn package_directory_into_zip(
         );
     }
 
+    fs::create_dir_all(destination_dir)
+        .with_context(|| format!("failed to create {}", destination_dir.display()))?;
+
     let mut entries = fs::read_dir(source_dir)
         .with_context(|| format!("failed to read standalone directory {}", source_dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -840,21 +878,13 @@ fn package_directory_into_zip(
 
     entries.sort_by_key(|entry| entry.file_name());
 
-    if !archive_dir.as_os_str().is_empty() {
-        zip.add_directory(path_to_zip_name(archive_dir), options)
-            .with_context(|| format!("failed to add directory {}", archive_dir.display()))?;
-    }
-
     for entry in entries {
         let source_path = entry.path();
-        let archive_path = archive_dir.join(entry.file_name());
-        package_path_into_zip(
+        let destination_path = destination_dir.join(entry.file_name());
+        materialize_path(
             &source_path,
-            &archive_path,
-            root,
-            options,
-            zip,
-            progress,
+            &destination_path,
+            &canonical_root,
             active_targets,
         )?;
     }
@@ -863,18 +893,18 @@ fn package_directory_into_zip(
     Ok(())
 }
 
-fn package_path_into_zip(
+fn materialize_path(
     source_path: &Path,
-    archive_path: &Path,
+    destination_path: &Path,
     root: &Path,
-    options: SimpleFileOptions,
-    zip: &mut ZipWriter<File>,
-    progress: &mut ZipProgress,
     active_targets: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(source_path)
         .with_context(|| format!("failed to inspect {}", source_path.display()))?;
 
+    // On Windows, junctions are reparse points but are not always reported as
+    // ordinary symlinks. read_link() reliably exposes their target, so use both
+    // checks before treating an entry as a normal file/directory.
     let is_link_like = metadata.file_type().is_symlink() || fs::read_link(source_path).is_ok();
 
     if is_link_like {
@@ -882,11 +912,7 @@ fn package_path_into_zip(
             .canonicalize()
             .with_context(|| format!("failed to resolve dependency link {}", source_path.display()))?;
 
-        let canonical_root = root
-            .canonicalize()
-            .context("failed to resolve standalone root")?;
-
-        if !target.starts_with(&canonical_root) {
+        if !target.starts_with(root) {
             bail!(
                 "standalone dependency link resolves outside the artifact root: {} -> {}",
                 source_path.display(),
@@ -895,17 +921,19 @@ fn package_path_into_zip(
         }
 
         if target.is_dir() {
-            package_directory_into_zip(
-                &target,
-                archive_path,
-                root,
-                options,
-                zip,
-                progress,
-                active_targets,
-            )?;
+            materialize_directory(&target, destination_path, root, active_targets)?;
         } else if target.is_file() {
-            add_file_to_zip(zip, &target, archive_path, options, progress)?;
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(&target, destination_path).with_context(|| {
+                format!(
+                    "failed to materialize {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
         } else {
             bail!(
                 "standalone dependency link target is neither a file nor directory: {}",
@@ -917,17 +945,24 @@ fn package_path_into_zip(
     }
 
     if metadata.is_dir() {
-        package_directory_into_zip(
-            source_path,
-            archive_path,
-            root,
-            options,
-            zip,
-            progress,
-            active_targets,
-        )?;
+        materialize_directory(source_path, destination_path, root, active_targets)?;
     } else if metadata.is_file() {
-        add_file_to_zip(zip, source_path, archive_path, options, progress)?;
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(source_path, destination_path).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        })?;
+    } else {
+        bail!(
+            "standalone output contains an unsupported filesystem entry: {}",
+            source_path.display()
+        );
     }
 
     Ok(())
