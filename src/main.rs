@@ -216,8 +216,8 @@ fn build_application(args: &DeployArgs) -> Result<(Framework, PackageManager, Pa
     run_build(&context)?;
 
     let standalone_dir = prepare_standalone_output(&context)?;
-    materialize_standalone_output(&standalone_dir)
-        .context("failed to materialize standalone runtime dependencies")?;
+    install_self_contained_runtime_dependencies(&standalone_dir)
+        .context("failed to install self-contained standalone runtime dependencies")?;
     validate_standalone_output(&standalone_dir)?;
     let output_path = artifact_output_path(&args.build_id)?;
     create_artifact(&standalone_dir, &output_path)?;
@@ -632,185 +632,43 @@ fn prepare_standalone_output(context: &BuildContext) -> Result<PathBuf> {
 }
 
 
-fn is_link_like(path: &Path, metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
+fn install_self_contained_runtime_dependencies(standalone_dir: &Path) -> Result<()> {
+    let package_json = standalone_dir.join("package.json");
+    if !package_json.is_file() {
+        bail!(
+            "Next.js standalone output is missing package.json: {}",
+            package_json.display()
+        );
     }
 
-    // pnpm uses symbolic links and, on Windows, directory junctions/reparse
-    // points for node_modules entries.
-    if fs::read_link(path).is_ok() {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-/// Create a completely new standalone tree with all links/junctions resolved.
-///
-/// We deliberately do not rewrite the original Next.js standalone directory
-/// in place. pnpm's Windows junction layout can point back into the original
-/// build node_modules tree, and mutating those junctions while traversing the
-/// same tree makes cycle detection and rename/delete semantics unnecessarily
-/// fragile.
-fn materialize_standalone_output(standalone_dir: &Path) -> Result<()> {
-    let parent = standalone_dir
-        .parent()
-        .context("standalone output has no parent directory")?;
-
-    let temporary = parent.join(format!(
-        ".meshscale-standalone-materialized-{}",
-        std::process::id()
-    ));
-
-    if temporary.exists() {
-        fs::remove_dir_all(&temporary).with_context(|| {
+    let node_modules = standalone_dir.join("node_modules");
+    if node_modules.exists() {
+        fs::remove_dir_all(&node_modules).with_context(|| {
             format!(
-                "failed to remove stale materialization directory {}",
-                temporary.display()
+                "failed to remove Next.js traced node_modules from {}",
+                node_modules.display()
             )
         })?;
     }
 
     info!(
-        source = %standalone_dir.display(),
-        destination = %temporary.display(),
-        "materializing standalone output into a fresh directory"
+        directory = %standalone_dir.display(),
+        "installing runtime dependencies into a clean standalone node_modules"
     );
 
-    let mut active_sources = Vec::new();
-    if let Err(error) = copy_materialized_path(standalone_dir, &temporary, &mut active_sources) {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err(error);
-    }
-
-    let backup = parent.join(format!(
-        ".meshscale-standalone-original-{}",
-        std::process::id()
-    ));
-
-    if backup.exists() {
-        fs::remove_dir_all(&backup).with_context(|| {
-            format!("failed to remove stale standalone backup {}", backup.display())
-        })?;
-    }
-
-    fs::rename(standalone_dir, &backup).with_context(|| {
-        format!(
-            "failed to move original standalone directory {}",
-            standalone_dir.display()
-        )
-    })?;
-
-    if let Err(error) = fs::rename(&temporary, standalone_dir) {
-        let _ = fs::rename(&backup, standalone_dir);
-        let _ = fs::remove_dir_all(&temporary);
-        return Err(error).with_context(|| {
-            format!(
-                "failed to install materialized standalone directory {}",
-                standalone_dir.display()
-            )
-        });
-    }
-
-    fs::remove_dir_all(&backup).with_context(|| {
-        format!(
-            "failed to remove original standalone directory backup {}",
-            backup.display()
-        )
-    })?;
-
-    info!("standalone runtime dependencies materialized");
-    Ok(())
-}
-
-fn copy_materialized_path(
-    source: &Path,
-    destination: &Path,
-    active_sources: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect {}", source.display()))?;
-
-    if is_link_like(source, &metadata) {
-        let resolved = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve linked path {}", source.display()))?;
-
-        if active_sources.iter().any(|path| path == &resolved) {
-            bail!(
-                "detected a filesystem cycle while materializing {} -> {}",
-                source.display(),
-                resolved.display()
-            );
-        }
-
-        return copy_materialized_path(&resolved, destination, active_sources);
-    }
-
-    if metadata.is_dir() {
-        let canonical = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve {}", source.display()))?;
-
-        if active_sources.iter().any(|path| path == &canonical) {
-            bail!(
-                "detected a directory cycle while materializing {}",
-                source.display()
-            );
-        }
-
-        fs::create_dir_all(destination)
-            .with_context(|| format!("failed to create {}", destination.display()))?;
-
-        active_sources.push(canonical);
-        let result = (|| -> Result<()> {
-            for entry in fs::read_dir(source)
-                .with_context(|| format!("failed to read {}", source.display()))?
-            {
-                let entry = entry
-                    .with_context(|| format!("failed to read an entry in {}", source.display()))?;
-
-                let child_destination = destination.join(entry.file_name());
-                copy_materialized_path(&entry.path(), &child_destination, active_sources)?;
-            }
-            Ok(())
-        })();
-        active_sources.pop();
-
-        return result;
-    }
-
-    if metadata.is_file() {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        fs::copy(source, destination).with_context(|| {
-            format!(
-                "failed to copy file {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-
-        return Ok(());
-    }
-
-    bail!(
-        "unsupported filesystem entry while materializing: {}",
-        source.display()
+    // Next's standalone output contains the runtime package manifest, but pnpm
+    // represents its traced dependency tree using links/junctions. Do not try
+    // to interpret or rewrite that graph. Instead, discard it and ask npm to
+    // materialize the manifest into a conventional filesystem tree.
+    run_command(
+        "npm",
+        &["install", "--omit=dev", "--no-audit", "--no-fund"],
+        standalone_dir,
+        "standalone runtime dependency installation",
     )
+    .context("failed to materialize runtime dependencies with npm")?;
+
+    Ok(())
 }
 
 fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
