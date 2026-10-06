@@ -637,10 +637,8 @@ fn is_link_like(path: &Path, metadata: &fs::Metadata) -> bool {
         return true;
     }
 
-    // Windows pnpm uses directory junctions for node_modules entries.
-    // Depending on how metadata is obtained, the reparse-point bit is not
-    // always enough to identify them, so also ask the filesystem whether the
-    // path has a link target.
+    // pnpm uses symbolic links and, on Windows, directory junctions/reparse
+    // points for node_modules entries.
     if fs::read_link(path).is_ok() {
         return true;
     }
@@ -657,100 +655,85 @@ fn is_link_like(path: &Path, metadata: &fs::Metadata) -> bool {
     }
 }
 
+/// Create a completely new standalone tree with all links/junctions resolved.
+///
+/// We deliberately do not rewrite the original Next.js standalone directory
+/// in place. pnpm's Windows junction layout can point back into the original
+/// build node_modules tree, and mutating those junctions while traversing the
+/// same tree makes cycle detection and rename/delete semantics unnecessarily
+/// fragile.
 fn materialize_standalone_output(standalone_dir: &Path) -> Result<()> {
+    let parent = standalone_dir
+        .parent()
+        .context("standalone output has no parent directory")?;
+
+    let temporary = parent.join(format!(
+        ".meshscale-standalone-materialized-{}",
+        std::process::id()
+    ));
+
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary).with_context(|| {
+            format!(
+                "failed to remove stale materialization directory {}",
+                temporary.display()
+            )
+        })?;
+    }
+
+    info!(
+        source = %standalone_dir.display(),
+        destination = %temporary.display(),
+        "materializing standalone output into a fresh directory"
+    );
+
     let mut active_sources = Vec::new();
-    materialize_directory(standalone_dir, &mut active_sources)
-        .context("failed to materialize standalone runtime dependencies")?;
+    if let Err(error) = copy_materialized_path(standalone_dir, &temporary, &mut active_sources) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    let backup = parent.join(format!(
+        ".meshscale-standalone-original-{}",
+        std::process::id()
+    ));
+
+    if backup.exists() {
+        fs::remove_dir_all(&backup).with_context(|| {
+            format!("failed to remove stale standalone backup {}", backup.display())
+        })?;
+    }
+
+    fs::rename(standalone_dir, &backup).with_context(|| {
+        format!(
+            "failed to move original standalone directory {}",
+            standalone_dir.display()
+        )
+    })?;
+
+    if let Err(error) = fs::rename(&temporary, standalone_dir) {
+        let _ = fs::rename(&backup, standalone_dir);
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to install materialized standalone directory {}",
+                standalone_dir.display()
+            )
+        });
+    }
+
+    fs::remove_dir_all(&backup).with_context(|| {
+        format!(
+            "failed to remove original standalone directory backup {}",
+            backup.display()
+        )
+    })?;
 
     info!("standalone runtime dependencies materialized");
     Ok(())
 }
 
-fn materialize_directory(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-
-    if is_link_like(path, &metadata) {
-        return materialize_link_like_in_place(path, active_sources);
-    }
-
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
-
-    if active_sources.iter().any(|source| source == &canonical) {
-        bail!("detected a directory cycle while materializing {}", path.display());
-    }
-
-    active_sources.push(canonical);
-    let result = (|| -> Result<()> {
-        for entry in fs::read_dir(path)
-            .with_context(|| format!("failed to read {}", path.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("failed to read an entry in {}", path.display()))?;
-            materialize_entry(&entry.path(), active_sources)?;
-        }
-        Ok(())
-    })();
-    active_sources.pop();
-
-    result
-}
-
-fn materialize_entry(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-
-    if is_link_like(path, &metadata) {
-        materialize_link_like_in_place(path, active_sources)
-    } else if metadata.is_dir() {
-        materialize_directory(path, active_sources)
-    } else if metadata.is_file() {
-        Ok(())
-    } else {
-        bail!("unsupported filesystem entry in standalone output: {}", path.display())
-    }
-}
-
-fn materialize_link_like_in_place(path: &Path, active_sources: &mut Vec<PathBuf>) -> Result<()> {
-    let resolved = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve linked path {}", path.display()))?;
-
-    if active_sources.iter().any(|source| source == &resolved) {
-        bail!("detected a linked-path cycle while materializing {}", path.display());
-    }
-
-    let temporary = path.with_file_name(format!(
-        ".meshscale-materialize-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("entry")
-    ));
-
-    if temporary.exists() || temporary.is_symlink() {
-        remove_path(&temporary)?;
-    }
-
-    copy_resolved_path(&resolved, &temporary, active_sources)?;
-
-    remove_path(path)?;
-    fs::rename(&temporary, path).with_context(|| {
-        format!(
-            "failed to replace linked path {} with materialized contents",
-            path.display()
-        )
-    })?;
-
-    Ok(())
-}
-
-fn copy_resolved_path(
+fn copy_materialized_path(
     source: &Path,
     destination: &Path,
     active_sources: &mut Vec<PathBuf>,
@@ -761,13 +744,17 @@ fn copy_resolved_path(
     if is_link_like(source, &metadata) {
         let resolved = source
             .canonicalize()
-            .with_context(|| format!("failed to resolve nested linked path {}", source.display()))?;
+            .with_context(|| format!("failed to resolve linked path {}", source.display()))?;
 
         if active_sources.iter().any(|path| path == &resolved) {
-            bail!("detected a linked-path cycle while materializing {}", source.display());
+            bail!(
+                "detected a filesystem cycle while materializing {} -> {}",
+                source.display(),
+                resolved.display()
+            );
         }
 
-        return copy_resolved_path(&resolved, destination, active_sources);
+        return copy_materialized_path(&resolved, destination, active_sources);
     }
 
     if metadata.is_dir() {
@@ -776,7 +763,10 @@ fn copy_resolved_path(
             .with_context(|| format!("failed to resolve {}", source.display()))?;
 
         if active_sources.iter().any(|path| path == &canonical) {
-            bail!("detected a directory cycle while materializing {}", source.display());
+            bail!(
+                "detected a directory cycle while materializing {}",
+                source.display()
+            );
         }
 
         fs::create_dir_all(destination)
@@ -789,8 +779,9 @@ fn copy_resolved_path(
             {
                 let entry = entry
                     .with_context(|| format!("failed to read an entry in {}", source.display()))?;
+
                 let child_destination = destination.join(entry.file_name());
-                copy_resolved_entry(&entry.path(), &child_destination, active_sources)?;
+                copy_materialized_path(&entry.path(), &child_destination, active_sources)?;
             }
             Ok(())
         })();
@@ -807,61 +798,19 @@ fn copy_resolved_path(
 
         fs::copy(source, destination).with_context(|| {
             format!(
-                "failed to materialize {} to {}",
+                "failed to copy file {} to {}",
                 source.display(),
                 destination.display()
             )
         })?;
+
         return Ok(());
     }
 
-    bail!("unsupported filesystem entry: {}", source.display())
-}
-
-fn copy_resolved_entry(
-    source: &Path,
-    destination: &Path,
-    active_sources: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect {}", source.display()))?;
-
-    if is_link_like(source, &metadata) {
-        let resolved = source
-            .canonicalize()
-            .with_context(|| format!("failed to resolve linked path {}", source.display()))?;
-
-        if active_sources.iter().any(|path| path == &resolved) {
-            bail!("detected a linked-path cycle while materializing {}", source.display());
-        }
-
-        return copy_resolved_path(&resolved, destination, active_sources);
-    }
-
-    copy_resolved_path(source, destination, active_sources)
-}
-
-fn remove_path(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-
-    if is_link_like(path, &metadata) {
-        if metadata.is_dir() {
-            fs::remove_dir(path)
-                .with_context(|| format!("failed to remove linked directory {}", path.display()))?;
-        } else {
-            fs::remove_file(path)
-                .with_context(|| format!("failed to remove linked file {}", path.display()))?;
-        }
-    } else if metadata.is_file() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-    } else if metadata.is_dir() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-    }
-
-    Ok(())
+    bail!(
+        "unsupported filesystem entry while materializing: {}",
+        source.display()
+    )
 }
 
 fn validate_standalone_output(standalone_dir: &Path) -> Result<()> {
