@@ -1,39 +1,71 @@
 # MeshScale Builder
 
-Initial Rust prototype for the MeshScale application builder.
+Internal Rust build service/CLI used by MeshScale to turn a Git repository into a relocatable deployment output.
 
-## Current flow
+This is **not** the customer-facing MeshScale CLI.
 
-1. Clone a GitHub repository using a personal access token.
-2. Check out the requested commit SHA.
-3. Resolve the optional project root directory.
-4. Detect the framework from `package.json`.
-5. Detect the package manager from `packageManager` or a lockfile.
-6. Install dependencies.
-7. Temporarily configure Next.js with `output: "standalone"` without modifying the user's committed config.
-8. Run the package's `build` script.
-9. Prepare the self-contained `.next/standalone/` output, including `public/` and `.next/static/` assets.
-10. ZIP the standalone directory as the deployment artifact, reporting file/byte progress while packaging.
-11. Print a machine-readable JSON result containing the status, artifact path, duration, and ZIP size.
+## Current implementation
 
-Docker, NATS, Trigger.dev, S3 and builder orchestration are intentionally not part of this CLI yet.
+The implemented pipeline currently covers phases A-C:
 
-## Usage
+1. Clone the requested GitHub repository.
+2. Check out the exact requested commit.
+3. Resolve the optional project directory.
+4. Detect Next.js.
+5. Detect npm, pnpm or Yarn.
+6. Install dependencies using the project's normal package manager.
+7. Run the project's normal Next.js build.
+8. Read Next.js output-file-tracing manifests.
+9. Run @vercel/nft against the Next.js production server entrypoint.
+10. Combine those runtime traces.
+11. Produce .meshscale/output with manifest.json, static/, and runtime/.
+12. Validate that the output contains no symbolic links or Windows junction/reparse-point links.
 
-```bash
-cargo run -- deploy \
+The builder does **not** modify next.config.* and does **not** force output: "standalone".
+
+## Output layout
+
+~~~text
+.meshscale/
+└── output/
+    ├── manifest.json
+    ├── static/
+    │   ├── _next/
+    │   │   └── static/
+    │   └── ...
+    └── runtime/
+        ├── .next/
+        ├── node_modules/
+        ├── package.json
+        └── next.config.*
+~~~
+
+The runtime uses the normal Next.js production server command:
+
+~~~text
+node runtime/node_modules/next/dist/bin/next start
+~~~
+
+The future local runner and future edge runtime will consume the manifest rather than depending on the original source checkout.
+
+## Commands
+
+Build:
+
+~~~bash
+cargo run -- build \
   --git-username nfworking \
   --git-repo example \
   --git-hash 0123456789abcdef0123456789abcdef01234567 \
   --git-branch main \
   --access-token "$GITHUB_TOKEN" \
   --build-id build_123
-```
+~~~
 
-For a monorepo where the Next.js application's `package.json` is not at the repository root:
+Monorepo application:
 
-```bash
-cargo run -- deploy \
+~~~bash
+cargo run -- build \
   --dir apps/web \
   --git-username nfworking \
   --git-repo example \
@@ -41,30 +73,40 @@ cargo run -- deploy \
   --git-branch main \
   --access-token "$GITHUB_TOKEN" \
   --build-id build_123
-```
+~~~
 
-The artifact is written to the current working directory as `artifact-<build-id>.zip`. The ZIP contains the contents of the Next.js standalone output at its root, so the deployment runtime does not need the original source tree or a separate `.next/` directory.
+The output defaults to .meshscale/output and can be changed with --output.
 
-During packaging, the builder logs progress such as the number of files and source bytes processed. The original Next.js configuration is restored after the build, including when the build fails.
+## Phase D and E structure
 
-## Framework detection
+The command surface already reserves:
 
-The prototype currently recognizes Next.js when `next` exists in `dependencies`, `devDependencies`, or `optionalDependencies`.
+~~~text
+meshscale-builder run <output>
+meshscale-builder upload <output>
+~~~
 
-The detector is intentionally isolated behind a small function so additional framework rules can be added without changing the build orchestration.
+Phase D (local runtime) and Phase E (R2 upload) are intentionally **not implemented yet**. They currently fail explicitly rather than pretending to work.
 
-## Package managers
+## Next.js tracing
 
-The prototype prefers the `packageManager` field in `package.json`, then falls back to:
+Next.js itself uses @vercel/nft for output file tracing and emits .nft.json manifests during production builds. The builder consumes those manifests and also invokes the same NFT library through scripts/trace-runtime.cjs for the production server entrypoint.
 
-- `pnpm-lock.yaml` → pnpm
-- `yarn.lock` → Yarn
-- `package-lock.json` → npm
+This keeps the artifact generation aligned with Next.js' documented tracing model instead of recreating dependency resolution in Rust.
 
-If no package manager metadata is present, it falls back to `npm install`.
+## Platform support
 
-## Security notes
+The builder targets:
 
-The current prototype accepts the GitHub PAT through `--access-token` because that is the interface being prototyped. This should be replaced with a safer secret-delivery mechanism before the CLI is used by `builderd`, so the token is not exposed through process arguments.
+- Linux
+- Windows
 
-Build execution is deliberately not sandboxed yet. Do not run this prototype against untrusted repositories outside an isolated development environment.
+Other operating systems are intentionally unsupported.
+
+The artifact validation rejects symbolic links and Windows junction/reparse-point links so the generated runtime is relocatable between build and deployment environments.
+
+## Security
+
+The GitHub access token is currently supplied through --access-token because this is still an internal prototype interface. It should eventually be injected through a safer secret mechanism so it is not exposed in process arguments.
+
+Build execution is not sandboxed yet. Only run builds from repositories that MeshScale is prepared to execute with the privileges of the builder host.
