@@ -91,7 +91,7 @@ Phase D (local runtime) and Phase E (R2 upload) are intentionally **not implemen
 
 Next.js itself uses @vercel/nft during production builds and emits `.nft.json` manifests, including `.next/next-server.js.nft.json` for the production server. The builder consumes those manifests directly. If the project enables Next's `output: "standalone"`, the generated `.next/standalone` tree is intentionally ignored: it has its own copied `.nft.json` files whose paths are relative to the standalone staging tree, not the original project root. MeshScale builds its own relocatable runtime from the source project's tracing manifests instead.
 
-This is intentional: Next.js has already performed the dependency tracing, so the builder does not need to load `@vercel/nft` from the customer's dependency tree. This also avoids depending on package-manager-specific transitive dependency layouts such as pnpm's strict node_modules structure.
+This is intentional: Next.js has already performed the dependency tracing, so the builder does not need to load `@vercel/nft` from the customer's dependency tree. The builder preserves the logical paths recorded by each trace while resolving the source through the filesystem. This is important for pnpm: a traced `node_modules/next/...` file may physically resolve through pnpm's `.pnpm` store links, but the output must still contain the normal `node_modules/next/...` path expected by Node.js. This materializes traced dependencies instead of copying pnpm symlink/junction layout into the artifact.
 
 ## Platform support
 
