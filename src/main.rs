@@ -835,10 +835,7 @@ fn copy_resolved_entry(
             bail!("detected a linked-path cycle while materializing {}", source.display());
         }
 
-        active_sources.push(resolved.clone());
-        let result = copy_resolved_path(&resolved, destination, active_sources);
-        active_sources.pop();
-        return result;
+        return copy_resolved_path(&resolved, destination, active_sources);
     }
 
     copy_resolved_path(source, destination, active_sources)
