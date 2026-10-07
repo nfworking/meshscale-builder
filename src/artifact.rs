@@ -26,7 +26,7 @@ pub fn create_output(
     }
 
     let adapter_metadata = next_dir.join("meshscale-adapter.json");
-    if !adapter_metadata.is_file() {
+    if metadata.version == 2 && !adapter_metadata.is_file() {
         bail!(
             "MeshScale Next.js adapter did not produce deployment metadata: {}",
             adapter_metadata.display()
@@ -79,8 +79,13 @@ pub fn create_output(
     info!(files = all_traced_files.len(), "collected runtime trace");
 
     copy_runtime_files(&runtime_dir, &all_traced_files)?;
-    copy_next_runtime(project_dir, &runtime_dir, &all_traced_files)?;
     copy_required_runtime_files(project_dir, &runtime_dir)?;
+    if adapter_metadata.is_file() {
+        let destination = runtime_dir.join(".next").join("meshscale-adapter.json");
+        fs::create_dir_all(destination.parent().context("adapter metadata has no parent")?)?;
+        fs::copy(&adapter_metadata, &destination)
+            .with_context(|| format!("failed to copy {}", adapter_metadata.display()))?;
+    }
     copy_public_assets(project_dir, &static_dir)?;
     copy_next_static(project_dir, &static_dir)?;
     fs::write(
@@ -564,16 +569,6 @@ fn copy_runtime_files(runtime_dir: &Path, files: &BTreeMap<String, PathBuf>) -> 
     }
 
     Ok(())
-}
-
-fn copy_next_runtime(
-    project_dir: &Path,
-    runtime_dir: &Path,
-    traced: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    let source = project_dir.join(".next");
-    let destination = runtime_dir.join(".next");
-    copy_tree_excluding_generated(&source, &destination, traced)
 }
 
 fn is_generated_standalone_tree(path: &Path, next_dir: &Path) -> bool {
