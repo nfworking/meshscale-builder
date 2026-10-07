@@ -11,7 +11,6 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use serde::Serialize;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -186,12 +185,6 @@ struct ProjectRuntime {
 struct AppState {
     projects: Arc<HashMap<String, Arc<ProjectRuntime>>>,
     default: Option<Arc<ProjectRuntime>>,
-}
-
-#[derive(Debug, Serialize)]
-struct RunnerProject {
-    host: String,
-    output: String,
 }
 
 pub fn run(args: RunArgs) -> Result<()> {
