@@ -56,11 +56,7 @@ pub fn create_output(
             .join(output_dir)
     };
 
-    if output_dir.exists() {
-        fs::remove_dir_all(&output_dir).with_context(|| {
-            format!("failed to remove previous output {}", output_dir.display())
-        })?;
-    }
+    prepare_output_dir(&output_dir)?;
 
     let runtime_dir = output_dir.join("runtime");
     let static_dir = output_dir.join("static");
@@ -147,6 +143,31 @@ pub fn create_output(
     validate_output(&output_dir)?;
 
     Ok(output_dir)
+}
+
+fn prepare_output_dir(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    // build.log is opened before artifact generation so the log contains the
+    // complete build lifecycle. Preserve it while replacing the generated
+    // artifact directories/files from the previous build.
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to inspect {}", output_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_name() == "build.log" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_next_trace_files(
