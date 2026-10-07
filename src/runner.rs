@@ -16,7 +16,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -58,10 +58,13 @@ struct FunctionManager {
     entrypoint: PathBuf,
     idle_timeout: Duration,
     worker: Mutex<Option<Worker>>,
+    active_requests: AtomicUsize,
 }
 
 impl FunctionManager {
     async fn invoke(&self, mut request: Request) -> Result<Response> {
+        self.active_requests.fetch_add(1, Ordering::AcqRel);
+        let _active = ActiveRequest { manager: self };
         let addr = self.ensure_worker().await?;
         let uri = format!(
             "http://{}{}",
@@ -158,7 +161,9 @@ impl FunctionManager {
             return;
         };
 
-        if existing.last_used.elapsed() < self.idle_timeout {
+        if self.active_requests.load(Ordering::Acquire) != 0
+            || existing.last_used.elapsed() < self.idle_timeout
+        {
             return;
         }
 
@@ -178,6 +183,16 @@ impl FunctionManager {
             let _ = existing.child.wait().await;
         }
         *worker = None;
+    }
+}
+
+struct ActiveRequest<'a> {
+    manager: &'a FunctionManager,
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        self.manager.active_requests.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -303,6 +318,7 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
             entrypoint,
             idle_timeout: Duration::from_secs(args.idle_timeout_secs),
             worker: Mutex::new(None),
+            active_requests: AtomicUsize::new(0),
         });
 
         let key = if host == "*" {
