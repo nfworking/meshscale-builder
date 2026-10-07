@@ -195,6 +195,9 @@ fn load_dotenv(path: Option<&Path>) -> Result<BTreeMap<String, String>> {
 }
 
 pub fn remove_credentials(command: &mut std::process::Command) {
+    // Build credentials are intentionally never propagated to package-manager,
+    // build, tracing, or runner child processes.
+    command.env_remove("MESHSCALE_GITHUB_TOKEN");
     for name in ENV_NAMES {
         command.env_remove(name);
         command.env_remove(name.replacen("MESHSCALE", "MESHScale", 1));
