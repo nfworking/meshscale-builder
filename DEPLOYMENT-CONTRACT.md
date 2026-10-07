@@ -64,9 +64,9 @@ Supported static status is 200. Next hashed assets use `public, max-age=31536000
 
 The local reference evaluator supports HEAD, conditional ETag/date requests and ranges on both cached and streamed static responses. Dynamic responses are streamed and never placed in the static cache.
 
-## Server runtime and platform
+## Function runtime and platform
 
-`runtime` starts `node runtime/.meshscale-server.cjs` from working directory `runtime`, with no extra arguments. The entrypoint loads captured build configuration rather than evaluating source configuration.
+`runtime` starts `node runtime/function-entry.cjs` from working directory `runtime`, with no extra arguments. The entrypoint is a MeshScale function runtime: it does not call `next start` or `startServer`. It resolves the adapter-produced routing table and invokes Next.js Node entrypoints through the public `handler(req, res, ctx)` interface. The MeshScale edge owns HTTP routing; the local runner starts this worker lazily and keeps it warm for subsequent requests.
 
 `platform` records OS, architecture, Node version and ABI. Native dependencies require a compatible host; Windows artifacts are not Linux artifacts. The local runner enforces OS/architecture and ABI. Production infrastructure should use the recorded Node version and platform.
 
