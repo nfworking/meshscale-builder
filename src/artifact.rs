@@ -571,51 +571,6 @@ fn copy_runtime_files(runtime_dir: &Path, files: &BTreeMap<String, PathBuf>) -> 
     Ok(())
 }
 
-fn is_generated_standalone_tree(path: &Path, next_dir: &Path) -> bool {
-    path.strip_prefix(next_dir)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .is_some_and(|component| component.as_os_str() == "standalone")
-}
-
-fn copy_tree_excluding_generated(
-    source: &Path,
-    destination: &Path,
-    traced: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-
-    let walker = WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.path().file_name().and_then(|name| name.to_str());
-            name != Some("cache")
-                && name != Some("standalone")
-                && !name.is_some_and(|name| name.ends_with(".nft.json"))
-        });
-
-    for entry in walker {
-        let entry = entry.context("failed to walk Next.js runtime directory")?;
-        let logical = Path::new(".next")
-            .join(
-                entry
-                    .path()
-                    .strip_prefix(source)
-                    .context("invalid Next.js runtime path")?,
-            )
-            .to_string_lossy()
-            .replace('\\', "/");
-        if traced.contains_key(&logical) {
-            continue;
-        }
-        copy_entry(source, destination, entry.path())?;
-    }
-
-    Ok(())
-}
-
 fn copy_required_runtime_files(project_dir: &Path, runtime_dir: &Path) -> Result<()> {
     let source = project_dir.join("package.json");
     fs::copy(&source, runtime_dir.join("package.json"))
