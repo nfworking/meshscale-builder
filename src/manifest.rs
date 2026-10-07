@@ -439,11 +439,22 @@ pub fn resolve_path(output: &Path, relative: &Path) -> Result<PathBuf> {
         relative.display()
     );
 
-    // Keep the canonical path for validation, but return the original lexical
+    // Keep the canonical path for validation, but return a normal absolute
     // path to callers. On Windows, Path::canonicalize() can produce a
     // \\?\\ verbatim path. Node.js does not reliably accept those paths as
     // process entrypoints and can fail with EISDIR: lstat 'C:'.
-    Ok(output.join(relative))
+    //
+    // The runner also sets the runtime directory as Node's cwd, so returning
+    // a relative path here would make Node resolve it relative to the runtime
+    // directory a second time (runtime/runtime/...).
+    let absolute_output = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve output directory to an absolute path")?
+            .join(output)
+    };
+    Ok(absolute_output.join(relative))
 }
 
 #[cfg(test)]
