@@ -66,7 +66,10 @@ impl FunctionManager {
         let uri = format!(
             "http://{}{}",
             addr,
-            request.uri().path_and_query().map_or("/", |value| value.as_str())
+            request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str())
         )
         .parse::<Uri>()
         .context("failed to construct function invocation URI")?;
