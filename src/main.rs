@@ -155,7 +155,9 @@ impl BuildMetadata {
     }
 }
 
-struct FileLogGuard {\n    _guard: tracing_appender::non_blocking::WorkerGuard,\n}
+struct FileLogGuard {
+    _guard: tracing_appender::non_blocking::WorkerGuard,
+}
 
 fn main() {
     let cli = Cli::parse();
