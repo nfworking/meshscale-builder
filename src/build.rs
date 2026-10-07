@@ -245,9 +245,13 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
 }
 
 fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
-    let next_package = project_dir.join("node_modules").join("next").join("package.json");
+    let next_package = project_dir
+        .join("node_modules")
+        .join("next")
+        .join("package.json");
     let package: Value = serde_json::from_slice(
-        &fs::read(&next_package).with_context(|| format!("failed to read {}", next_package.display()))?,
+        &fs::read(&next_package)
+            .with_context(|| format!("failed to read {}", next_package.display()))?,
     )
     .context("installed Next.js package.json is invalid")?;
     let version = package
@@ -256,7 +260,13 @@ fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
         .context("installed Next.js package.json is missing version")?;
 
     let spec = format!("@next/routing@{version}");
-    let args = ["install", "--no-save", "--package-lock=false", "--ignore-scripts", spec.as_str()];
+    let args = [
+        "install",
+        "--no-save",
+        "--package-lock=false",
+        "--ignore-scripts",
+        spec.as_str(),
+    ];
     info!(command = %format_command("npm", &args), "installing Next.js adapter routing runtime");
     run_command("npm", &args, project_dir, "adapter routing installation")
 }
