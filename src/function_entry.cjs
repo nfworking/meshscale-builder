@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
+const { pathToFileURL } = require('node:url');
 const { resolveRoutes } = require('@next/routing');
 
 process.env.NODE_ENV = 'production';
@@ -21,16 +22,22 @@ const outputs = [
 const pathnames = outputs.map((output) => output.pathname);
 const handlers = new Map();
 
-function loadHandler(output) {
+async function loadHandler(output) {
   const key = output.id;
   if (handlers.has(key)) return handlers.get(key);
 
   const modulePath = path.resolve(root, output.filePath);
-  const loaded = require(modulePath);
-  const handler =
-    loaded.handler ||
-    loaded.default ||
-    loaded;
+  let loaded;
+  try {
+    loaded = require(modulePath);
+  } catch (error) {
+    if (error && error.code === 'ERR_REQUIRE_ESM') {
+      loaded = await import(pathToFileURL(modulePath).href);
+    } else {
+      throw error;
+    }
+  }
+  const handler = loaded.handler || loaded.default || loaded;
   if (typeof handler !== 'function') {
     throw new Error(`adapter output ${output.id} does not export a handler`);
   }
@@ -89,7 +96,7 @@ async function handle(req, res) {
       return;
     }
 
-    const handler = loadHandler(output);
+    const handler = await loadHandler(output);
 
     await handler(req, res, {
       waitUntil: (promise) => {
