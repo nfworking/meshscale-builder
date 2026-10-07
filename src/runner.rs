@@ -11,7 +11,6 @@ use futures_util::stream::unfold;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -189,13 +188,16 @@ impl Worker {
             reader: Mutex::new(None),
         });
         let (ready_tx, ready_rx) = oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
         let reader_worker = worker.clone();
         let reader = tokio::spawn(async move {
             let mut stdout = stdout;
             let result = loop {
                 match read_frame(&mut stdout).await {
                     Ok(frame) if frame.header.kind == "ready" => {
-                        let _ = ready_tx.send(Ok(()));
+                        if let Some(sender) = ready_tx.take() {
+                            let _ = sender.send(Ok(()));
+                        }
                     }
                     Ok(frame) => {
                         let id = frame.header.id;
