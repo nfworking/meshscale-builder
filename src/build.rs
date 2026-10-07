@@ -259,7 +259,11 @@ fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
         .and_then(Value::as_str)
         .context("installed Next.js package.json is missing version")?;
 
-    let spec = format!("@next/routing@{version}");
+    // @next/routing is released independently from Next.js, so an exact
+    // @next/routing@<next-version> install can fail even when that Next.js
+    // version is valid. Keep routing on the same stable major/minor line and
+    // let npm select the latest published patch in that line.
+    let spec = adapter_routing_spec(version)?;
     let args = [
         "install",
         "--no-save",
@@ -267,10 +271,41 @@ fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
         "--ignore-scripts",
         spec.as_str(),
     ];
-    info!(command = %format_command("npm", &args), "installing Next.js adapter routing runtime");
+    info!(
+        next_version = version,
+        routing_spec = %spec,
+        command = %format_command("npm", &args),
+        "installing Next.js adapter routing runtime"
+    );
     run_command("npm", &args, project_dir, "adapter routing installation")
 }
 
+fn adapter_routing_spec(next_version: &str) -> Result<String> {
+    let stable = next_version
+        .split_once('-')
+        .map_or(next_version, |(version, _)| version);
+    let mut components = stable.split('.');
+    let major = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid major component")?;
+    let minor = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid minor component")?;
+    let _patch = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid patch component")?;
+
+    if components.next().is_some() {
+        bail!("installed Next.js version is not a valid semver version: {next_version}");
+    }
+
+    // ~M.m.0 allows routing patch releases to move independently while
+    // preventing an accidental minor-version jump.
+    Ok(format!("@next/routing@~{major}.{minor}.0"))
+}
 fn run_build(
     project_dir: &Path,
     package_manager: PackageManager,
@@ -368,3 +403,41 @@ fn format_command(executable: &str, args: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::adapter_routing_spec;
+
+    #[test]
+    fn adapter_routing_uses_same_major_minor_line() {
+        assert_eq!(
+            adapter_routing_spec("16.3.4").unwrap(),
+            "@next/routing@~16.3.0"
+        );
+        assert_eq!(
+            adapter_routing_spec("16.3.8").unwrap(),
+            "@next/routing@~16.3.0"
+        );
+        assert_eq!(
+            adapter_routing_spec("16.4.0").unwrap(),
+            "@next/routing@~16.4.0"
+        );
+    }
+
+    #[test]
+    fn adapter_routing_strips_prerelease_suffix() {
+        assert_eq!(
+            adapter_routing_spec("16.4.0-canary.12").unwrap(),
+            "@next/routing@~16.4.0"
+        );
+    }
+
+    #[test]
+    fn adapter_routing_rejects_invalid_versions() {
+        assert!(adapter_routing_spec("16").is_err());
+        assert!(adapter_routing_spec("16.x.4").is_err());
+        assert!(adapter_routing_spec("16.3").is_err());
+        assert!(adapter_routing_spec("16.3.4.1").is_err());
+    }
+}
+
