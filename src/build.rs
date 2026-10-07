@@ -181,7 +181,31 @@ fn resolve_project_dir(repo_dir: &Path, dir: &str) -> Result<PathBuf> {
         bail!("--dir is not a directory: {}", canonical_project.display());
     }
 
+    // Node.js on Windows currently mishandles extended-length (\\\\?\\) paths
+    // when resolving the entry script. Rust's canonicalize() returns that form,
+    // so strip the verbatim prefix before handing the project path to npm/Next.
+    // Keep the canonical path for the containment check above; only the path
+    // returned to Node-facing build commands is normalized.
+    #[cfg(windows)]
+    {
+        let normalized = normalize_windows_node_path(&canonical_project);
+        return Ok(normalized);
+    }
+
+    #[cfg(not(windows))]
     Ok(canonical_project)
+}
+
+#[cfg(windows)]
+fn normalize_windows_node_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\\UNC\\") {
+        PathBuf::from(format!(r"\\\\{rest}"))
+    } else if let Some(rest) = value.strip_prefix(r"\\?\\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn load_package_json(path: &Path) -> Result<Value> {
