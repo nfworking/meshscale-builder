@@ -322,7 +322,10 @@ impl Worker {
                             return None;
                         }
                         Some(Ok(frame)) if frame.header.kind == "error" => {
-                            let error = frame.header.error.unwrap_or_else(|| "function worker invocation failed".to_owned());
+                            let error = frame
+                                .header
+                                .error
+                                .unwrap_or_else(|| "function worker invocation failed".to_owned());
                             worker.pending.lock().await.remove(&id);
                             return Some((Err(std::io::Error::other(error)), (receiver, active)));
                         }
@@ -334,7 +337,9 @@ impl Worker {
                         None => {
                             worker.pending.lock().await.remove(&id);
                             return Some((
-                                Err(std::io::Error::other("function worker closed before ending the response")),
+                                Err(std::io::Error::other(
+                                    "function worker closed before ending the response",
+                                )),
                                 (receiver, active),
                             ));
                         }
