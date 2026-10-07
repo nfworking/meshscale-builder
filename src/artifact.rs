@@ -138,10 +138,7 @@ fn collect_next_trace_files(
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut files = BTreeMap::new();
 
-    for entry in WalkDir::new(next_dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_generated_standalone_tree(entry.path(), next_dir))
+    for entry in WalkDir::new(next_dir).follow_links(false).into_iter()
     {
         let entry = entry.context("failed to walk Next.js trace directory")?;
         let path = entry.path();
