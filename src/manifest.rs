@@ -180,7 +180,7 @@ fn load_mode(output: &Path, server_only: bool) -> Result<Manifest> {
         assets.as_ref().is_none_or(|path| path.is_dir()),
         "manifest static directory is not a directory"
     );
-    if function_runtime {
+    if function_runtime && manifest.version == 2 {
         let adapter = resolve_path(
             output,
             &Path::new("runtime").join(".next").join("meshscale-adapter.json"),
