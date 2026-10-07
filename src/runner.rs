@@ -121,7 +121,10 @@ impl Worker {
                     Err(error) => break Err(error),
                 }
             };
-            let message = format!("{result:#}");
+            let message = match result {
+                Ok(()) => "function worker protocol closed".to_owned(),
+                Err(error) => format!("{error:#}"),
+            };
             let pending = std::mem::take(&mut *reader_worker.pending.lock().await);
             for (_, sender) in pending { let _ = sender.send(Err(message.clone())).await; }
         });
