@@ -6,7 +6,7 @@ This is **not** the customer-facing MeshScale CLI.
 
 ## Current implementation
 
-The implemented pipeline covers building, manifest-driven local execution, static R2 publication and server packaging:
+The implemented pipeline covers building, manifest-driven local execution, static R2 publication and direct function execution:
 
 1. Clone the requested GitHub repository.
 2. Check out the exact requested commit.
@@ -42,14 +42,7 @@ The builder does **not** modify next.config.* and does **not** force output: "st
         └── function-entry.cjs
 ~~~
 
-New artifacts contain a production-only Node entrypoint:
-
-~~~text
-cd .meshscale/output/runtime
-node function-entry.cjs
-~~~
-
-It starts Next.js using the configuration captured in `.next/required-server-files.json`, rather than re-evaluating the source `next.config.*`. The builder neither edits the source configuration nor requires `output: "standalone"`.
+New artifacts contain a production-only function entrypoint. It does not open an HTTP port and it does not run next start. It loads the Next.js Adapter outputs and invokes the exported Node handler directly through the runner's persistent IPC protocol. The builder neither edits the source next.config.* nor requires output: standalone.
 
 The local runner and future edge runtime consume the manifest rather than depending on the original source checkout. The [deployment contract](DEPLOYMENT-CONTRACT.md) defines routing and publication semantics; [manifest.schema.json](manifest.schema.json) defines the version-2 JSON shape.
 
@@ -90,75 +83,60 @@ Build uploads by default and requires organization/project IDs and R2 configurat
 
 Build success JSON includes an `upload` object with bucket, prefix, manifest key, and uploaded file count/bytes; it is `null` when upload is disabled. If upload fails after a successful build, the command fails but preserves the local artifact and reports its output path. `build_time_ms` includes upload time when enabled. Logs and progress go to stderr; result JSON goes to stdout.
 
-## Local runner (phase D)
+## Local runner
 
 Run a built artifact:
 
-~~~text
+~~~bash
 meshscale-builder run .meshscale/output
 ~~~
 
-From the source checkout, use `cargo run -- run .meshscale/output`.
+The local runner is a miniature MeshScale execution node. Rust owns the public HTTP listener, host routing and static delivery. Dynamic requests are invoked directly inside a persistent Node worker over framed stdin/stdout IPC. There is no second HTTP server, no loopback HTTP proxy, and no per-request Node process.
 
-The runner validates the Next.js/Node manifest, required paths and link-free artifact before starting anything. Version-2 artifacts also undergo full static inventory/digest verification and OS, architecture and Node ABI checks. Node must be on PATH. Only run trusted artifacts: their Node code executes with your user privileges.
+The lifecycle is lazy:
 
-The Rust HTTP router listens at `http://localhost:3000` (IPv4 loopback). It spawns the manifest's entrypoint with its working directory and arguments, running the Next.js production server on `127.0.0.1:3100`. It waits up to 60 seconds for Node to accept connections, probing every ~100 ms with a 500 ms per-probe limit. A startup failure reports the number of probes and the last probe error; occupied ports, invalid manifests, startup failures and unexpected Node exits fail explicitly. Ctrl+C stops accepting requests, allows up to five seconds for active requests, then terminates and reaps the Node child.
+1. Runner starts with zero Node workers.
+2. A dynamic request selects a deployment.
+3. The function manager starts that deployment's Node worker.
+4. The worker sends a ready frame and stays warm for subsequent requests.
+5. Multiple requests can be in flight concurrently through the same worker.
+6. The worker is stopped after the configured idle timeout.
+7. A crashed worker is detected and recreated on the next request.
 
-The runner also accepts the previous version-1 manifest layout using `node_modules/next/dist/bin/next` with `["start"]`, provided the artifact actually contains that CLI and its dependencies. Rebuild older incomplete artifacts to get the new production entrypoint.
+The Node entrypoint implements the Next.js Node adapter contract: handler(req, res, ctx). Rust supplies the request method, URL, headers and body; Node supplies response status, headers and streamed body chunks back over the IPC protocol. Next.js documents this direct Node entrypoint shape for deployment adapters. 
 
-Override the ports when needed (they must be different):
+Multiple deployments can share one local edge process:
 
-~~~text
-meshscale-builder run .meshscale/output --port 8080 --runtime-port 8100
+~~~bash
+meshscale-builder run \
+  --project app.localhost=./app-output \
+  --project blog.localhost=./blog-output
 ~~~
 
-For version 2, only exact manifest static rules are served directly for GET and HEAD:
+Static requests never start Node. Dynamic requests are routed through the manifest and then invoked by the matching warm worker.
 
-| URL | Artifact file |
-| --- | --- |
-| `/favicon.ico` | `static/favicon.ico` |
-| `/_next/static/chunks/app.js` | `static/_next/static/chunks/app.js` |
-| `/static/logo.png` | `static/static/logo.png` (from `public/static/logo.png`) |
+Version-2 artifacts are validated before execution, including their static inventory and runtime paths. Node must be on PATH. Only run trusted artifacts because their application code executes with the same privileges as the runner.
 
-There is no extra `/static` alias: public assets keep their original URL paths. Eligible Pages HTML/JSON and App HTML have explicit URL rules pointing into a private `_prerender/` object namespace; requesting that storage namespace directly never exposes those responses. Static responses support manifest content types, SHA-256 ETags, Last-Modified, HEAD, byte ranges and conditional requests. Directory paths are not turned into index pages. Traversal and Windows path escapes are rejected.
+The IPC protocol uses bounded binary frames with a JSON control header and raw body bytes. Request and response frames carry a request ID so concurrent invocations can share one Node process. Response bodies are streamed without base64 encoding. Request bodies are currently bounded to 64 MiB.
 
-Everything else is streamed to Next.js: dynamic routes, ISR/PPR, image optimization, missing assets, non-GET/HEAD requests, preview cookies, RSC/prefetch/action variants and prerender requests with query parameters. Middleware, custom routing, locales and other unsupported global semantics conservatively disable direct routing. The proxy preserves method, path/query, body, Host, response status, redirects and multiple cookies, removes hop-by-hop headers, and sets forwarding headers from the local connection. HTTP upgrades/WebSockets return 501; proxy connection failures return 502 and are logged.
+For version 2, only exact manifest static rules are served directly for GET and HEAD. Everything else goes to the function: dynamic routes, ISR/PPR, image optimization, missing assets, non-GET/HEAD requests, preview cookies, RSC/prefetch/action variants and prerender requests with query parameters. HTTP upgrades/WebSockets are rejected by the local runner until an explicit streaming upgrade protocol is added.
+
+The runner can host a single default artifact or multiple host-routed projects. It does not contact R2 during execution; the artifact is self-contained apart from application-managed external services.
 
 ### Lazy in-memory static cache
 
-The first eligible request reads static bytes from **local disk**, verifies the manifest digest, and inserts them into a bounded LRU. Later hits use shared memory bytes without rereading disk. This does not download from R2 and does not cache Node responses. Concurrent misses are coalesced; fills are serialized to bound read buffers.
+The first eligible request reads static bytes from local disk, verifies the manifest digest, and inserts them into a bounded LRU. Later hits use shared memory bytes without rereading disk. This does not download from R2 and does not cache Node responses.
 
-Defaults are **256 MiB resident payload / 16 MiB per file**. Oversized files stream from disk. Configure or disable caching:
+Defaults are 256 MiB resident payload / 16 MiB per file. Oversized files stream from disk. Configure or disable caching:
 
 ~~~text
 meshscale-builder run .meshscale/output --static-cache-mib 128 --static-cache-max-file-mib 8
 meshscale-builder run .meshscale/output --static-cache-mib 0
 ~~~
 
-When enabled, the per-file limit must be positive and no larger than the total. The budget bounds cache-owned payload and one fill buffer, not total process RSS: active response references, metadata, HTTP buffers and Node memory are additional. Keep artifacts immutable while running; restart/rebuild after changes. Version-1 artifacts retain legacy file-existence streaming without this cache.
-
-The runner can also start an output directory with no top-level `static/`; all requests then go to Next.js, using retained runtime fallback files. It does not contact R2.
-
 ### Request and cache statistics
 
-Every request is logged to stderr with where it was answered from (the query string is never logged):
-
-~~~text
-INFO request method=GET path=/about status=200 source=cache-hit ms=0.21
-INFO request method=GET path=/dashboard status=200 source=server ms=12.96
-~~~
-
-| `source` | Meaning |
-| --- | --- |
-| `cache-hit` | Static bytes served from the in-memory cache, with no disk read |
-| `cache-fill` | First request: read from local disk, verified, and inserted into the cache |
-| `static-disk` | Static file streamed from disk (cache disabled, file over the per-file limit, multi-range, or v1 artifact) |
-| `static-304` | Conditional request answered from manifest validators (304/412) without reading the file |
-| `server` | No static rule matched; forwarded to Node (`ms` is time to response headers) |
-| `server-static-missing` | A static rule matched but its file was missing, so the request fell back to Node |
-| `rejected` | Rejected or failed locally (invalid path, upgrade, internal error) |
-
-A `stats` summary line (request totals per source, cache hit rate, bytes served from memory, cache entries/bytes/capacity, disk reads and evictions) is logged every 30 seconds while traffic is arriving, and a `final stats` line is logged on shutdown. The hit rate is hits divided by static responses with a body. Counters cover the current process only.
+Requests record whether they were served from memory, disk, or the function worker. Periodic statistics report request totals, cache hit rate, bytes served from memory, cache capacity, disk reads and evictions.
 
 ## Output efficiency
 
