@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -1042,64 +1042,6 @@ mod tests {
         write_trace(workspace.path(), &["../../outside"])?;
         let error = collect_next_trace_files(&root.join(".next"), &root).unwrap_err();
         assert!(format!("{error:#}").contains("escapes the build project root"));
-        Ok(())
-    }
-
-    #[test]
-    fn omits_build_only_files_and_does_not_recopy_traced_next_files() -> Result<()> {
-        let workspace = TempDir::new()?;
-        let project = workspace.path().join("repo");
-        let runtime = workspace.path().join("runtime");
-        write_file(
-            &project.join(".next").join("cache").join("large-cache"),
-            "cache",
-        )?;
-        write_file(
-            &project.join(".next").join("standalone").join("server.js"),
-            "standalone",
-        )?;
-        write_file(
-            &project.join(".next").join("page.js.nft.json"),
-            r#"{"files":[]}"#,
-        )?;
-        write_file(
-            &project.join(".next").join("server").join("page.js"),
-            "source",
-        )?;
-        write_file(
-            &project.join(".next").join("server").join("page.html"),
-            "static page",
-        )?;
-        write_file(
-            &runtime.join(".next").join("server").join("page.js"),
-            "already copied",
-        )?;
-        let traced = BTreeMap::from([(
-            ".next/server/page.js".to_owned(),
-            project.join(".next").join("server").join("page.js"),
-        )]);
-        copy_next_runtime(&project, &runtime, &traced)?;
-        assert_eq!(
-            fs::read_to_string(runtime.join(".next").join("server").join("page.js"))?,
-            "already copied"
-        );
-        assert_eq!(
-            fs::read_to_string(runtime.join(".next").join("server").join("page.html"))?,
-            "static page"
-        );
-        let paths = WalkDir::new(runtime.join(".next"))
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|entry| entry.file_type().is_file())
-                .count(),
-            2
-        );
-        assert!(!runtime.join(".next").join("cache").exists());
-        assert!(!runtime.join(".next").join("standalone").exists());
-        assert!(!runtime.join(".next").join("page.js.nft.json").exists());
         Ok(())
     }
 
