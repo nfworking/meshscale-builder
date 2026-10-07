@@ -334,7 +334,7 @@ fn collect_adapter_assets(
 
     let metadata: Adapter = serde_json::from_slice(&fs::read(metadata_path)?)
         .context("invalid MeshScale adapter metadata")?;
-    let groups = ["pages", "pagesApi", "appPages", "appRoutes", "staticFiles"];
+    let groups = ["pages", "pagesApi", "appPages", "appRoutes"];
     for group in groups {
         let Some(outputs) = metadata.outputs.get(group).and_then(serde_json::Value::as_array) else {
             continue;
