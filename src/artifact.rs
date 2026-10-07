@@ -75,7 +75,12 @@ pub fn create_output(
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
     if metadata.version == 2 {
-        collect_adapter_assets(project_dir, &project_root, &adapter_metadata, &mut all_traced_files)?;
+        collect_adapter_assets(
+            project_dir,
+            &project_root,
+            &adapter_metadata,
+            &mut all_traced_files,
+        )?;
     }
     if metadata.version == 2 {
         ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
@@ -89,7 +94,11 @@ pub fn create_output(
     copy_required_runtime_files(project_dir, &runtime_dir)?;
     if adapter_metadata.is_file() {
         let destination = runtime_dir.join(".next").join("meshscale-adapter.json");
-        fs::create_dir_all(destination.parent().context("adapter metadata has no parent")?)?;
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("adapter metadata has no parent")?,
+        )?;
         fs::copy(&adapter_metadata, &destination)
             .with_context(|| format!("failed to copy {}", adapter_metadata.display()))?;
     }
@@ -145,8 +154,7 @@ fn collect_next_trace_files(
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut files = BTreeMap::new();
 
-    for entry in WalkDir::new(next_dir).follow_links(false).into_iter()
-    {
+    for entry in WalkDir::new(next_dir).follow_links(false).into_iter() {
         let entry = entry.context("failed to walk Next.js trace directory")?;
         let path = entry.path();
         if !entry.file_type().is_file() || path.extension().and_then(|v| v.to_str()) != Some("json")
@@ -336,7 +344,11 @@ fn collect_adapter_assets(
         .context("invalid MeshScale adapter metadata")?;
     let groups = ["pages", "pagesApi", "appPages", "appRoutes"];
     for group in groups {
-        let Some(outputs) = metadata.outputs.get(group).and_then(serde_json::Value::as_array) else {
+        let Some(outputs) = metadata
+            .outputs
+            .get(group)
+            .and_then(serde_json::Value::as_array)
+        else {
             continue;
         };
         for output in outputs {
@@ -347,9 +359,10 @@ fn collect_adapter_assets(
                 let relative = relative
                     .as_str()
                     .context("adapter asset path is not a string")?;
-                let source = project_dir.join(relative).canonicalize().with_context(|| {
-                    format!("adapter asset does not exist: {relative}")
-                })?;
+                let source = project_dir
+                    .join(relative)
+                    .canonicalize()
+                    .with_context(|| format!("adapter asset does not exist: {relative}"))?;
                 let logical = Path::new(logical);
                 ensure!(
                     logical.is_relative()
@@ -372,11 +385,16 @@ fn ensure_runtime_package_manifest(
     files: &mut BTreeMap<String, PathBuf>,
     package_name: &str,
 ) -> Result<()> {
-    let source = project_root.join("node_modules").join(package_name).join("package.json");
-    let source = source.canonicalize().with_context(|| {
-        format!("required runtime package is missing: {package_name}")
-    })?;
-    let logical = Path::new("node_modules").join(package_name).join("package.json");
+    let source = project_root
+        .join("node_modules")
+        .join(package_name)
+        .join("package.json");
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("required runtime package is missing: {package_name}"))?;
+    let logical = Path::new("node_modules")
+        .join(package_name)
+        .join("package.json");
     let logical = logical.to_string_lossy().replace('\\', "/");
     collect_trace_entry(files, project_root, &logical, &source)
 }
