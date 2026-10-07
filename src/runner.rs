@@ -616,6 +616,12 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 }
 
 async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
+    info!(
+        host = %project.host,
+        method = %request.method(),
+        path = %request.uri().path(),
+        "dispatching request"
+    );
     if request.headers().contains_key(header::UPGRADE) {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -680,6 +686,13 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
             }
         };
 
+        info!(
+            object = object_key,
+            path = %candidate.display(),
+            status = object.status,
+            bytes = bytes.len(),
+            "serving static object"
+        );
         let mut response = Response::builder().status(object.status);
         response = response
             .header(header::CONTENT_TYPE, &object.content_type)
