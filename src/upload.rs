@@ -818,6 +818,12 @@ pub(crate) mod tests {
                 }).to_string())?;
         let mut metadata = manifest::load(output.path())?;
         metadata.version = 2;
+        metadata.runtime.entrypoint = PathBuf::from("runtime/function-entry.cjs");
+        fs::write(runtime.join("function-entry.cjs"), "// test")?;
+        fs::write(
+            runtime.join(".next").join("meshscale-adapter.json"),
+            r#"{\"version\":1}"#,
+        )?;
         metadata.deployment.commit = "1234567890abcdef1234567890abcdef12345678".into();
         metadata.deployment.next_build_id = Some("next-build".into());
         metadata.deployment.next_version = Some("16.3.4".into());
