@@ -183,7 +183,9 @@ fn load_mode(output: &Path, server_only: bool) -> Result<Manifest> {
     if function_runtime && manifest.version == 2 {
         let adapter = resolve_path(
             output,
-            &Path::new("runtime").join(".next").join("meshscale-adapter.json"),
+            &Path::new("runtime")
+                .join(".next")
+                .join("meshscale-adapter.json"),
         )?;
         let adapter: serde_json::Value = serde_json::from_slice(&fs::read(adapter)?)
             .context("invalid MeshScale Next.js adapter metadata")?;
