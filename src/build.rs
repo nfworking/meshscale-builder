@@ -14,7 +14,10 @@ use tracing::{info, warn};
 use crate::artifact::create_output;
 use crate::{BuildArgs, BuildMetadata, Framework, PackageManager};
 
-pub fn build_application(\n    args: &BuildArgs,\n    progress: &crate::cli::BuildProgress,\n) -> Result<(BuildMetadata, PathBuf)> {
+pub fn build_application(
+    args: &BuildArgs,
+    progress: &crate::cli::BuildProgress,
+) -> Result<(BuildMetadata, PathBuf)> {
     validate_args(args)?;
 
     let workspace = TempDir::new().context("failed to create temporary build workspace")?;
@@ -26,8 +29,8 @@ pub fn build_application(\n    args: &BuildArgs,\n    progress: &crate::cli::Bui
         "cloning repository"
     );
 
-    clone_repository(args, &repo_dir)?;
-    checkout_commit(&repo_dir, &args.git_hash)?;
+    progress.step("Cloning repository", || clone_repository(args, &repo_dir))?;
+    progress.step("Checking out commit", || checkout_commit(&repo_dir, &args.git_hash))?;
 
     let project_dir = resolve_project_dir(&repo_dir, &args.dir)?;
     let package_json = load_package_json(&project_dir.join("package.json"))?;
@@ -41,9 +44,15 @@ pub fn build_application(\n    args: &BuildArgs,\n    progress: &crate::cli::Bui
         "detected build configuration"
     );
 
-    install_dependencies(&project_dir, package_manager)?;
-    install_adapter_runtime_dependency(&project_dir, package_manager)?;
-    run_build(&project_dir, package_manager, &package_json)?;
+    progress.step("Installing dependencies", || {
+        install_dependencies(&project_dir, package_manager)
+    })?;
+    progress.step("Preparing Next.js adapter", || {
+        install_adapter_runtime_dependency(&project_dir, package_manager)
+    })?;
+    progress.step("Building application", || {
+        run_build(&project_dir, package_manager, &package_json)
+    })?;
 
     let metadata = BuildMetadata {
         version: 2,
@@ -61,7 +70,9 @@ pub fn build_application(\n    args: &BuildArgs,\n    progress: &crate::cli::Bui
         project_id: args.destination.project_id.clone(),
     };
 
-    let output_dir = progress.step("Packaging deployment artifact", || {\n        create_output(&project_dir, &metadata, &args.output)\n    })?;
+    let output_dir = progress.step("Packaging deployment artifact", || {
+        create_output(&project_dir, &metadata, &args.output)
+    })?;
     Ok((metadata, output_dir))
 }
 
@@ -422,9 +433,9 @@ fn run_build(
         .env("CI", "true")
         .env("NEXT_ADAPTER_PATH", &adapter_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .with_context(|| {
             format!(
                 "failed to start application build: {}",
@@ -433,11 +444,12 @@ fn run_build(
         });
 
     let _ = fs::remove_file(&adapter_path);
-    let status = status?;
-    if !status.success() {
+    let output = status?;
+    log_child_output("application build", &output);
+    if !output.status.success() {
         bail!(
             "application build failed with exit status {}",
-            status.code().map_or_else(
+            output.status.code().map_or_else(
                 || "terminated by signal".to_owned(),
                 |code| code.to_string()
             )
@@ -450,14 +462,14 @@ fn run_build(
 fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
     let mut command = Command::new(executable);
     crate::upload::remove_credentials(&mut command);
-    let status = command
+    let output = command
         .args(args)
         .current_dir(cwd)
         .env("CI", "true")
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .with_context(|| {
             format!(
                 "failed to start {operation}: {}",
@@ -465,10 +477,11 @@ fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> 
             )
         })?;
 
-    if !status.success() {
+    log_child_output(operation, &output);
+    if !output.status.success() {
         bail!(
             "{operation} failed with exit status {}",
-            status.code().map_or_else(
+            output.status.code().map_or_else(
                 || "terminated by signal".to_owned(),
                 |code| code.to_string()
             )
@@ -476,6 +489,15 @@ fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> 
     }
 
     Ok(())
+}
+
+fn log_child_output(operation: &str, output: &std::process::Output) {
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        tracing::info!(stream = "stdout", operation = %operation, "{line}");
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        tracing::info!(stream = "stderr", operation = %operation, "{line}");
+    }
 }
 
 fn format_command(executable: &str, args: &[&str]) -> String {
