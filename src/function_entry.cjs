@@ -2,8 +2,18 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { Readable, Writable } = require('node:stream');
 const { pathToFileURL } = require('node:url');
+
+// Next.js server modules expect AsyncLocalStorage to be exposed on the global
+// object by the Next runtime. MeshScale invokes adapter output modules directly
+// from its own Node worker, so provide the same runtime primitive before any
+// Next.js modules are loaded.
+if (!globalThis.AsyncLocalStorage) {
+  globalThis.AsyncLocalStorage = AsyncLocalStorage;
+}
+
 const { resolveRoutes } = require('@next/routing');
 
 process.env.NODE_ENV = 'production';
