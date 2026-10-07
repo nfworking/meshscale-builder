@@ -286,7 +286,8 @@ async fn upload_async(
     let (org, project) = destination.validate()?;
     artifact::validate_output(output)?;
     manifest::load(output)?.validate_v2()?;
-    let staging = std::sync::Arc::new(tempfile::TempDir::new().context("failed to create upload snapshot")?);
+    let staging =
+        std::sync::Arc::new(tempfile::TempDir::new().context("failed to create upload snapshot")?);
     let files = snapshot(output, staging.path())?;
     // Validate the snapshot, not just the live directory, before publishing anything.
     artifact::validate_output(staging.path())?;
@@ -601,6 +602,7 @@ pub(crate) mod tests {
         fail_asset: bool,
         fail_manifest: bool,
         signature_failure: bool,
+        archive_conflict_on_reserve: Option<PathBuf>,
         active: usize,
         max_active: usize,
     }
@@ -665,6 +667,11 @@ pub(crate) mod tests {
                 || (state.fail_manifest && path.ends_with("manifest.json"))
             {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if path.ends_with(RESERVATION)
+                && let Some(path) = &state.archive_conflict_on_reserve
+            {
+                fs::write(path, "concurrent archive").unwrap();
             }
             state.active += 1;
             state.max_active = state.max_active.max(state.active);
@@ -810,6 +817,7 @@ pub(crate) mod tests {
             metadata.r#static.objects.insert(file.into(), object);
         }
         fs::create_dir_all(runtime.join(".next").join("static"))?;
+        fs::create_dir_all(runtime.join("empty"))?;
         fs::write(
             runtime.join(".next").join("static").join("keep.js"),
             "fallback",
@@ -866,6 +874,7 @@ pub(crate) mod tests {
         );
         let mut archive = zip::ZipArchive::new(fs::File::open(&result.archive.path)?)?;
         assert!(archive.by_name("runtime/.next/static/keep.js").is_ok());
+        assert!(archive.by_name("runtime/empty/")?.is_dir());
         assert!(archive.by_name("static/bad.txt").is_err());
         let mut archived_manifest = Vec::new();
         std::io::Read::read_to_end(
@@ -1024,6 +1033,7 @@ pub(crate) mod tests {
                 store.fail_asset = !manifest_failure;
                 store.fail_manifest = manifest_failure;
             }
+
             let output = fixture()?;
             let error = upload_async(
                 output.path(),
@@ -1045,6 +1055,31 @@ pub(crate) mod tests {
                     .any(|key| key.ends_with("manifest.json"))
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packaging_failure_after_static_upload_never_publishes_manifest() -> Result<()> {
+        let server = mock_server().await?;
+        let output = fixture()?;
+        let original = fs::read(output.path().join("manifest.json"))?;
+        let destination =
+            crate::archive::destination(output.path(), &manifest::load(output.path())?)?;
+        server.store.lock().unwrap().archive_conflict_on_reserve = Some(destination.clone());
+        let error = upload_async(
+            output.path(),
+            &self::destination(),
+            None,
+            config(server.endpoint.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("archive already exists"));
+        let store = server.store.lock().unwrap();
+        assert_eq!(store.objects.len(), 4);
+        assert!(!store.order.iter().any(|key| key.ends_with("manifest.json")));
+        assert_eq!(fs::read(output.path().join("manifest.json"))?, original);
+        assert_eq!(fs::read_to_string(destination)?, "concurrent archive");
         Ok(())
     }
 

@@ -288,7 +288,10 @@ impl Manifest {
             validate_relative(key)?;
             ensure!(
                 object.sha256.len() == 64
-                    && object.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    && object
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
                 "invalid static SHA-256 for {key}"
             );
             ensure!(object.status == 200, "invalid static response status");

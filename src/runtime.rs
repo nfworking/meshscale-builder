@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -30,7 +30,13 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use tracing::{error, info};
 
-use crate::{artifact, manifest};
+use crate::{
+    artifact, manifest,
+    stats::{Source, Stats},
+};
+
+/// How often the runner logs a traffic summary when requests arrived since the last one.
+const STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -55,6 +61,15 @@ struct AppState {
     client: Client<HttpConnector, Body>,
     manifest: Option<Arc<manifest::Manifest>>,
     cache: Arc<crate::cache::StaticCache>,
+    stats: Arc<Stats>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 pub fn run(args: RunArgs) -> Result<()> {
@@ -84,6 +99,7 @@ async fn run_with_shutdown(
         .checked_mul(1024 * 1024)
         .context("cache per-file budget overflow")?;
     let cache = crate::cache::StaticCache::new(cache_bytes, max_file)?;
+    let stats = Arc::new(Stats::default());
     artifact::validate_server_output(&args.output)?;
     let manifest = manifest::load_server(&args.output)?;
     if let Some(platform) = &manifest.platform {
@@ -169,8 +185,20 @@ async fn run_with_shutdown(
             backend,
             client: Client::builder(TokioExecutor::new()).build(connector),
             manifest: (manifest.version == 2).then(|| Arc::new(manifest)),
-            cache,
+            cache: cache.clone(),
+            stats: stats.clone(),
         };
+        let _summary = AbortOnDrop(tokio::spawn({
+            let (stats, cache) = (stats.clone(), cache.clone());
+            async move {
+                let mut interval = tokio::time::interval(STATS_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    stats.log_if_changed(&cache.snapshot().await);
+                }
+            }
+        }));
         let router = Router::new().fallback(route).with_state(state);
         let (stop, stopped) = oneshot::channel::<()>();
         let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
@@ -198,6 +226,9 @@ async fn run_with_shutdown(
         }
     }.await;
 
+    if stats.totals().requests > 0 {
+        stats.log("final stats", &cache.snapshot().await);
+    }
     let cleanup = stop_runtime(&mut child).await;
     if let Err(error) = &cleanup {
         error!(error = %format!("{error:#}"), "failed to stop Node runtime");
@@ -257,11 +288,46 @@ fn asset_relative_path(path: &str) -> Result<PathBuf> {
     Ok(relative)
 }
 
+/// Records the response source in an extension so the logging wrapper can report it.
+fn tag(mut response: Response, source: Source) -> Response {
+    response.extensions_mut().insert(source);
+    response
+}
+
 async fn route(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    mut request: Request,
+    request: Request,
 ) -> Response {
+    let started = Instant::now();
+    let method = request.method().clone();
+    // The query string is deliberately not logged: it can carry tokens.
+    let path = request.uri().path().to_owned();
+    let mut response = dispatch(&state, peer, request).await;
+    let source = response
+        .extensions_mut()
+        .remove::<Source>()
+        .unwrap_or(Source::Rejected);
+    let status = response.status();
+    let memory_bytes = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    state.stats.record(source, memory_bytes);
+    info!(
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        source = %source.label(),
+        ms = %format!("{:.2}", started.elapsed().as_secs_f64() * 1000.0),
+        "request"
+    );
+    response
+}
+
+async fn dispatch(state: &AppState, peer: SocketAddr, mut request: Request) -> Response {
     let relative = match asset_relative_path(request.uri().path()) {
         Ok(path) => path,
         Err(error) => {
@@ -295,6 +361,7 @@ async fn route(
     } else {
         None
     };
+    let mut static_missing = false;
     if let Some(selected) = selected {
         let object = state
             .manifest
@@ -304,7 +371,7 @@ async fn route(
             && let Some(bytes) = state.cache.cached(&selected, object).await
         {
             match crate::cache::response(bytes, request.method(), request.headers(), object) {
-                Ok(Some(response)) => return response,
+                Ok(Some(response)) => return tag(response, Source::CacheHit),
                 Ok(None) => {}
                 Err(error) => {
                     error!(error = %error, "cached static response failed");
@@ -326,21 +393,31 @@ async fn route(
                                 error!(error = %error, "invalid static metadata");
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
-                            return response;
+                            return tag(response, Source::StaticConditional);
                         }
                         match state
                             .cache
-                            .get(&selected, &path, object)
+                            .lookup(&selected, &path, object)
                             .await
-                            .and_then(|bytes| {
-                                bytes
-                                    .map(|bytes| {
+                            .and_then(|found| {
+                                found
+                                    .map(|(bytes, resident)| {
                                         crate::cache::response(
                                             bytes,
                                             request.method(),
                                             request.headers(),
                                             object,
                                         )
+                                        .map(|response| {
+                                            response.map(|response| {
+                                                let source = if resident {
+                                                    Source::CacheHit
+                                                } else {
+                                                    Source::CacheFill
+                                                };
+                                                tag(response, source)
+                                            })
+                                        })
                                     })
                                     .transpose()
                                     .map(Option::flatten)
@@ -375,9 +452,9 @@ async fn route(
                             if !allowed {
                                 request.headers_mut().remove(header::RANGE);
                             }
-                            if request.method() == Method::HEAD {
-                                request.headers_mut().remove(header::RANGE);
-                            }
+                        }
+                        if request.method() == Method::HEAD {
+                            request.headers_mut().remove(header::RANGE);
                         }
                     }
                     match ServeFile::new(path).oneshot(request).await {
@@ -390,7 +467,7 @@ async fn route(
                                 error!(error = %error, "invalid static metadata");
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
-                            return response;
+                            return tag(response, Source::StaticStream);
                         }
                         Err(error) => match error {},
                     }
@@ -404,12 +481,16 @@ async fn route(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             },
-            Ok(_) => {}
+            Ok(_) => static_missing = object.is_some(),
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) => {}
+                ) =>
+            {
+                // Legacy v1 artifacts probe every GET path, so only manifest-listed files count.
+                static_missing = object.is_some()
+            }
             Err(error) => {
                 error!(error = %error, path = %candidate.display(), "failed to inspect static asset");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -452,14 +533,22 @@ async fn route(
         .headers_mut()
         .insert("x-forwarded-for", forwarded_for);
     *request.uri_mut() = uri;
+    let source = if static_missing {
+        Source::ServerStaticMissing
+    } else {
+        Source::Server
+    };
     match state.client.request(request).await {
         Ok(mut response) => {
             strip_hop_headers(response.headers_mut());
-            response.map(Body::new)
+            tag(response.map(Body::new), source)
         }
         Err(error) => {
             error!(error = %error, "Node runtime request failed");
-            (StatusCode::BAD_GATEWAY, "Node runtime unavailable").into_response()
+            tag(
+                (StatusCode::BAD_GATEWAY, "Node runtime unavailable").into_response(),
+                source,
+            )
         }
     }
 }
@@ -510,6 +599,23 @@ mod tests {
     }
 
     async fn test_router(assets: &Path) -> Result<(Router, ServerTask)> {
+        test_router_with_manifest(assets, None, 0).await
+    }
+
+    async fn test_router_with_manifest(
+        assets: &Path,
+        manifest: Option<manifest::Manifest>,
+        cache_bytes: u64,
+    ) -> Result<(Router, ServerTask)> {
+        test_router_with_stats(assets, manifest, cache_bytes, Arc::new(Stats::default())).await
+    }
+
+    async fn test_router_with_stats(
+        assets: &Path,
+        manifest: Option<manifest::Manifest>,
+        cache_bytes: u64,
+        stats: Arc<Stats>,
+    ) -> Result<(Router, ServerTask)> {
         let listener = TcpListener::bind(loopback(0)).await?;
         let backend = listener.local_addr()?;
         let app =
@@ -554,14 +660,227 @@ mod tests {
         let router = Router::new()
             .fallback(route)
             .with_state(AppState {
-                manifest: None,
-                cache: crate::cache::StaticCache::new(0, 0)?,
+                manifest: manifest.map(Arc::new),
+                cache: crate::cache::StaticCache::new(cache_bytes, cache_bytes)?,
+                stats,
                 assets: assets.canonicalize()?,
                 backend,
                 client: client(),
             })
             .layer(axum::Extension(ConnectInfo(loopback(1234))));
         Ok((router, ServerTask(task)))
+    }
+
+    #[tokio::test]
+    async fn stats_distinguish_cache_server_and_disk_responses() -> Result<()> {
+        let output = fixture("")?;
+        let assets = output.path().join("static");
+        fs::write(assets.join("gone.txt"), "gone")?;
+        let mut metadata = manifest::load(output.path())?;
+        let mut routing = crate::routing::Routing::new();
+        for (url, key) in [("/favicon.ico", "favicon.ico"), ("/gone.txt", "gone.txt")] {
+            metadata.r#static.objects.insert(
+                key.into(),
+                crate::static_output::object(&assets.join(key), "public_asset")?,
+            );
+            routing.insert_static(url.into(), key.into(), crate::routing::QueryPolicy::Ignore)?;
+        }
+        metadata.routing = Some(routing);
+        fs::remove_file(assets.join("gone.txt"))?;
+
+        let stats = Arc::new(Stats::default());
+        let (router, _backend) =
+            test_router_with_stats(&assets, Some(metadata.clone()), 1024, stats.clone()).await?;
+        for path in [
+            "/favicon.ico",
+            "/favicon.ico",
+            "/dashboard",
+            "/gone.txt",
+            "/%2e%2e/x",
+        ] {
+            router.clone().oneshot(request("GET", path, "")).await?;
+        }
+        let mut multi = request("GET", "/favicon.ico", "");
+        multi
+            .headers_mut()
+            .insert("range", HeaderValue::from_static("bytes=0-1,3-4"));
+        router.clone().oneshot(multi).await?;
+        router
+            .clone()
+            .oneshot(request("POST", "/favicon.ico", "x"))
+            .await?;
+        assert_eq!(stats.count(Source::CacheFill), 1);
+        assert_eq!(stats.count(Source::CacheHit), 1);
+        assert_eq!(stats.count(Source::StaticStream), 1);
+        assert_eq!(stats.count(Source::Server), 2);
+        assert_eq!(stats.count(Source::ServerStaticMissing), 1);
+        assert_eq!(stats.count(Source::Rejected), 1);
+        assert_eq!(stats.totals().requests, 7);
+
+        let disabled = Arc::new(Stats::default());
+        let (router, _backend) =
+            test_router_with_stats(&assets, Some(metadata), 0, disabled.clone()).await?;
+        router.oneshot(request("GET", "/favicon.ico", "")).await?;
+        assert_eq!(disabled.count(Source::StaticStream), 1);
+        assert_eq!(disabled.count(Source::CacheFill), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_static_routing_cache_and_streaming_have_http_parity() -> Result<()> {
+        let output = fixture("")?;
+        let assets = output.path().join("static");
+        fs::create_dir_all(assets.join("_prerender"))?;
+        fs::write(assets.join("_prerender").join("about.html"), "about")?;
+        fs::write(assets.join("empty.txt"), "")?;
+        fs::write(assets.join("100%+#.txt"), "encoded")?;
+        fs::write(assets.join("missing.txt"), "missing")?;
+        fs::write(assets.join("unlisted.txt"), "not exposed")?;
+        let mut metadata = manifest::load(output.path())?;
+        let mut routing = crate::routing::Routing::new();
+        for (url, key, query) in [
+            (
+                "/favicon.ico",
+                "favicon.ico",
+                crate::routing::QueryPolicy::Ignore,
+            ),
+            (
+                "/empty.txt",
+                "empty.txt",
+                crate::routing::QueryPolicy::Ignore,
+            ),
+            (
+                "/100%+#.txt",
+                "100%+#.txt",
+                crate::routing::QueryPolicy::Ignore,
+            ),
+            (
+                "/missing.txt",
+                "missing.txt",
+                crate::routing::QueryPolicy::Ignore,
+            ),
+            (
+                "/about",
+                "_prerender/about.html",
+                crate::routing::QueryPolicy::Empty,
+            ),
+        ] {
+            metadata.r#static.objects.insert(
+                key.into(),
+                crate::static_output::object(&assets.join(key), "public_asset")?,
+            );
+            routing.insert_static(url.into(), key.into(), query)?;
+        }
+        routing.validate(&metadata.r#static.objects)?;
+        metadata.routing = Some(routing);
+        let etag = metadata.r#static.objects["favicon.ico"].etag();
+        let modified = metadata.r#static.objects["favicon.ico"]
+            .last_modified
+            .clone();
+        let (streamed, _stream_backend) =
+            test_router_with_manifest(&assets, Some(metadata.clone()), 0).await?;
+        let (cached, _cache_backend) =
+            test_router_with_manifest(&assets, Some(metadata), 1024).await?;
+        for (method, url, headers) in [
+            ("GET", "/favicon.ico", vec![]),
+            ("HEAD", "/favicon.ico", vec![("range", "bytes=0-2")]),
+            ("GET", "/favicon.ico", vec![("range", "bytes=0-2")]),
+            ("GET", "/favicon.ico", vec![("range", "bytes=-3")]),
+            ("GET", "/favicon.ico", vec![("range", "bytes=-0")]),
+            ("GET", "/favicon.ico", vec![("range", "bytes=90-")]),
+            ("GET", "/favicon.ico", vec![("range", "bytes=garbage")]),
+            ("GET", "/empty.txt", vec![("range", "bytes=-1")]),
+            (
+                "GET",
+                "/favicon.ico",
+                vec![("range", "bytes=0-2"), ("if-range", "\"other\"")],
+            ),
+            (
+                "GET",
+                "/favicon.ico",
+                vec![("if-none-match", etag.as_str())],
+            ),
+            (
+                "GET",
+                "/favicon.ico",
+                vec![("if-modified-since", modified.as_str())],
+            ),
+            ("GET", "/favicon.ico", vec![("if-match", "\"other\"")]),
+            ("GET", "/100%25%2B%23.txt", vec![]),
+            ("GET", "/about", vec![]),
+        ] {
+            let mut a = request(method, url, "");
+            let mut b = request(method, url, "");
+            for (name, value) in headers {
+                a.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes())?,
+                    value.parse()?,
+                );
+                b.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes())?,
+                    value.parse()?,
+                );
+            }
+            let a = streamed.clone().oneshot(a).await?;
+            let b = cached.clone().oneshot(b).await?;
+            assert_eq!(a.status(), b.status(), "{method} {url}");
+            for name in [
+                "content-type",
+                "etag",
+                "last-modified",
+                "cache-control",
+                "accept-ranges",
+                "content-length",
+                "content-range",
+            ] {
+                assert_eq!(
+                    a.headers().get(name),
+                    b.headers().get(name),
+                    "{method} {url} {name}"
+                );
+            }
+            assert_eq!(
+                to_bytes(a.into_body(), 4096).await?,
+                to_bytes(b.into_body(), 4096).await?,
+                "{method} {url}"
+            );
+        }
+        fs::remove_file(assets.join("missing.txt"))?;
+        for (method, url, header) in [
+            ("GET", "/_prerender/about.html", None),
+            ("GET", "/unlisted.txt", None),
+            ("GET", "/missing.txt", None),
+            ("GET", "/about?user=1", None),
+            ("GET", "/about", Some(("rsc", "1"))),
+            ("GET", "/about", Some(("next-router-prefetch", "1"))),
+            ("GET", "/about", Some(("cookie", "__prerender_bypass=1"))),
+            ("POST", "/about", None),
+        ] {
+            for router in [&streamed, &cached] {
+                let mut req = request(method, url, "");
+                if let Some((name, value)) = header {
+                    req.headers_mut().insert(
+                        axum::http::HeaderName::from_bytes(name.as_bytes())?,
+                        value.parse()?,
+                    );
+                }
+                assert_eq!(
+                    router.clone().oneshot(req).await?.status(),
+                    StatusCode::CREATED,
+                    "{url}"
+                );
+            }
+        }
+        fs::remove_file(assets.join("favicon.ico"))?;
+        assert_eq!(
+            cached
+                .oneshot(request("GET", "/favicon.ico", ""))
+                .await?
+                .status(),
+            StatusCode::OK,
+            "cache hits must not perform filesystem reads"
+        );
+        Ok(())
     }
 
     fn request(method: &str, uri: &str, body: &str) -> Request {
@@ -690,6 +1009,7 @@ mod tests {
             .with_state(AppState {
                 manifest: None,
                 cache: crate::cache::StaticCache::new(0, 0)?,
+                stats: Arc::new(Stats::default()),
                 assets: assets.path().canonicalize()?,
                 backend,
                 client: client(),
@@ -926,17 +1246,27 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
     #[tokio::test]
     #[ignore = "installs and builds a real Next.js fixture; requires npm, Node and network access"]
     async fn runs_relocated_nextjs_application() -> Result<()> {
-        run_relocated_nextjs_application(crate::PackageManager::Npm).await
+        run_relocated_nextjs_application(crate::PackageManager::Npm, true).await
     }
 
     #[tokio::test]
     #[ignore = "installs and builds a pnpm Next.js fixture; requires npm, Node and network access"]
     async fn runs_relocated_pnpm_nextjs_application() -> Result<()> {
-        run_relocated_nextjs_application(crate::PackageManager::Pnpm).await
+        run_relocated_nextjs_application(crate::PackageManager::Pnpm, true).await
+    }
+
+    #[tokio::test]
+    #[ignore = "builds real npm and pnpm fixtures; checks static routing/schema/RSC without repeating ZIP verification"]
+    async fn checks_real_static_contract() -> Result<()> {
+        for manager in [crate::PackageManager::Npm, crate::PackageManager::Pnpm] {
+            run_relocated_nextjs_application(manager, false).await?;
+        }
+        Ok(())
     }
 
     async fn run_relocated_nextjs_application(
         package_manager: crate::PackageManager,
+        verify_archive: bool,
     ) -> Result<()> {
         let workspace = TempDir::new()?;
         let project = workspace.path().join("repo");
@@ -1037,6 +1367,21 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
             },
             &workspace.path().join("output"),
         )?;
+        let metadata = manifest::load(&output)?;
+        let about_key = metadata
+            .routing
+            .as_ref()
+            .context("missing routing")?
+            .select(&Method::GET, &"/about".parse()?, &HeaderMap::new())?
+            .context("real generated page was not classified as static")?;
+        let about_etag = metadata.r#static.objects[about_key].etag();
+        let schema: serde_json::Value = serde_json::from_slice(&fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("manifest.schema.json"),
+        )?)?;
+        ensure!(
+            jsonschema::validator_for(&schema)?.is_valid(&serde_json::to_value(&metadata)?),
+            "real manifest fails JSON Schema"
+        );
         ensure!(
             !output.join("runtime").join("next.config.mjs").exists(),
             "source configuration was copied"
@@ -1101,7 +1446,10 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
                 about.status()
             );
             ensure!(
-                about.headers().contains_key("etag"),
+                about
+                    .headers()
+                    .get("etag")
+                    .is_some_and(|etag| etag == about_etag.as_str()),
                 "generated HTML was not served by the static manifest"
             );
             let html = to_bytes(Body::new(about.into_body()), 1024 * 1024).await?;
@@ -1109,6 +1457,43 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
                 String::from_utf8_lossy(&html).contains("MeshScale generated page"),
                 "generated Next.js page was not preserved"
             );
+            let mut flight = request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/about?_rsc=test"),
+                "",
+            );
+            flight
+                .headers_mut()
+                .insert("rsc", HeaderValue::from_static("1"));
+            let response = client.request(flight).await?;
+            let mut direct = request(
+                "GET",
+                &format!("http://127.0.0.1:{runtime_port}/about?_rsc=test"),
+                "",
+            );
+            direct
+                .headers_mut()
+                .insert("rsc", HeaderValue::from_static("1"));
+            let direct = client.request(direct).await?;
+            ensure!(
+                response.status() == direct.status(),
+                "RSC proxy status differs from Node"
+            );
+            for name in ["content-type", "location", "etag"] {
+                ensure!(
+                    response.headers().get(name) == direct.headers().get(name),
+                    "RSC proxy header {name} differs from Node"
+                );
+            }
+            ensure!(
+                response
+                    .headers()
+                    .get("etag")
+                    .is_none_or(|etag| etag != about_etag.as_str()),
+                "RSC variant received the static HTML digest"
+            );
+            to_bytes(Body::new(direct.into_body()), 1024 * 1024).await?;
+            to_bytes(Body::new(response.into_body()), 1024 * 1024).await?;
             let echo = client
                 .request(request(
                     "POST",
@@ -1142,6 +1527,9 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
         let _ = stop.send(());
         timeout(Duration::from_secs(10), task).await???;
         result??;
+        if !verify_archive {
+            return Ok(());
+        }
         let publication = crate::upload::tests::publish_real_fixture(&output).await?;
         let extracted = workspace.path().join("server-only");
         let mut archive = zip::ZipArchive::new(fs::File::open(&publication.archive.path)?)?;

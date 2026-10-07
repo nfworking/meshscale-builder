@@ -184,7 +184,10 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
         base.is_empty() || (base.starts_with('/') && !base.ends_with('/')),
         "invalid Next basePath"
     );
-    if config["assetPrefix"].as_str().is_some_and(|prefix| !prefix.is_empty() && prefix != base) {
+    if config["assetPrefix"]
+        .as_str()
+        .is_some_and(|prefix| !prefix.is_empty() && prefix != base)
+    {
         reasons.push("custom-asset-prefix".to_owned());
     }
     let static_dir = output.join("static");
@@ -323,16 +326,23 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
             .get("initialHeaders")
             .and_then(Value::as_object)
             .is_some_and(|headers| {
-                headers.iter().any(|(key, value)| {
-                    match key.to_ascii_lowercase().as_str() {
+                headers
+                    .iter()
+                    .any(|(key, value)| match key.to_ascii_lowercase().as_str() {
                         "x-next-cache-tags" => false,
-                        "content-type" => value.as_str().is_none_or(|value| !value.to_ascii_lowercase().starts_with("text/html")),
-                        "cache-control" => value.as_str().is_none_or(|value| value.to_ascii_lowercase().split(',').any(|directive| {
-                            matches!(directive.trim().split('=').next().unwrap_or(""), "private" | "no-store" | "no-cache")
-                        })),
+                        "content-type" => value.as_str().is_none_or(|value| {
+                            !value.to_ascii_lowercase().starts_with("text/html")
+                        }),
+                        "cache-control" => value.as_str().is_none_or(|value| {
+                            value.to_ascii_lowercase().split(',').any(|directive| {
+                                matches!(
+                                    directive.trim().split('=').next().unwrap_or(""),
+                                    "private" | "no-store" | "no-cache"
+                                )
+                            })
+                        }),
                         _ => true,
-                    }
-                })
+                    })
             })
         {
             routing
@@ -545,7 +555,9 @@ mod tests {
         }
         assert!(!serde_json::to_string(&metadata)?.contains("never-publish-secret"));
         verify_inventory(&root.path().join("output"), &metadata)?;
-        let schema: Value = serde_json::from_str(include_str!("..\\manifest.schema.json"))?;
+        let schema: Value = serde_json::from_str(&fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("manifest.schema.json"),
+        )?)?;
         let validator = jsonschema::validator_for(&schema)?;
         let value = serde_json::to_value(&metadata)?;
         assert!(
@@ -564,6 +576,9 @@ mod tests {
             "redirects",
             "locale",
             "ppr",
+            "cache_components",
+            "asset_prefix",
+            "dynamic_io",
         ] {
             let (root, mut metadata) = fixture()?;
             let next = root.path().join("repo").join(".next");
@@ -572,12 +587,20 @@ mod tests {
                     &next.join("server").join("middleware-manifest.json"),
                     serde_json::json!({"version":3,"middleware":{"/":{}},"functions":{}}),
                 )?,
-                "locale" | "ppr" => write(
+                "locale" | "ppr" | "cache_components" | "asset_prefix" | "dynamic_io" => write(
                     &next.join("required-server-files.json"),
-                    if kind == "locale" {
-                        serde_json::json!({"config":{"i18n":{"locales":["en"]}}})
-                    } else {
-                        serde_json::json!({"config":{"experimental":{"ppr":true}}})
+                    match kind {
+                        "locale" => serde_json::json!({"config":{"i18n":{"locales":["en"]}}}),
+                        "ppr" => serde_json::json!({"config":{"experimental":{"ppr":true}}}),
+                        "cache_components" => {
+                            serde_json::json!({"config":{"cacheComponents":true}})
+                        }
+                        "dynamic_io" => {
+                            serde_json::json!({"config":{"experimental":{"dynamicIO":true}}})
+                        }
+                        _ => {
+                            serde_json::json!({"config":{"assetPrefix":"https://cdn.example.test"}})
+                        }
                     },
                 )?,
                 _ => {

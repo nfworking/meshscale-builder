@@ -12,6 +12,7 @@ mod manifest;
 mod routing;
 mod runtime;
 mod static_output;
+mod stats;
 mod upload;
 
 #[derive(Parser, Debug)]

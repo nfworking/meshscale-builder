@@ -139,6 +139,27 @@ When enabled, the per-file limit must be positive and no larger than the total. 
 
 The runner can also start an extracted server ZIP with no top-level `static/`; all requests then go to Next.js, using retained runtime fallback files. It does not contact R2.
 
+### Request and cache statistics
+
+Every request is logged to stderr with where it was answered from (the query string is never logged):
+
+~~~text
+INFO request method=GET path=/about status=200 source=cache-hit ms=0.21
+INFO request method=GET path=/dashboard status=200 source=server ms=12.96
+~~~
+
+| `source` | Meaning |
+| --- | --- |
+| `cache-hit` | Static bytes served from the in-memory cache, with no disk read |
+| `cache-fill` | First request: read from local disk, verified, and inserted into the cache |
+| `static-disk` | Static file streamed from disk (cache disabled, file over the per-file limit, multi-range, or v1 artifact) |
+| `static-304` | Conditional request answered from manifest validators (304/412) without reading the file |
+| `server` | No static rule matched; forwarded to Node (`ms` is time to response headers) |
+| `server-static-missing` | A static rule matched but its file was missing, so the request fell back to Node |
+| `rejected` | Rejected or failed locally (invalid path, upgrade, internal error) |
+
+A `stats` summary line (request totals per source, cache hit rate, bytes served from memory, cache entries/bytes/capacity, disk reads and evictions) is logged every 30 seconds while traffic is arriving, and a `final stats` line is logged on shutdown. The hit rate is hits divided by static responses with a body. Counters cover the current process only.
+
 ## Output efficiency
 
 The builder excludes `.next/cache`, `.next/standalone` and build-only `.nft.json` manifests from the copied Next.js tree. It also avoids walking an already collected dependency path again and avoids re-copying traced `.next` entries during the runtime-tree copy.
@@ -228,6 +249,12 @@ cargo test runtime::tests::runs_relocated_pnpm_nextjs_application -- --ignored -
 ~~~
 
 These require npm, Node and network access. The pnpm test obtains pnpm 10 through `npm exec` and exercises an isolated pnpm dependency layout.
+
+For a focused npm/pnpm schema, static HTML digest and RSC forwarding check without repeating ZIP extraction:
+
+~~~text
+cargo test runtime::tests::checks_real_static_contract -- --ignored --nocapture
+~~~
 
 ## Next.js tracing
 

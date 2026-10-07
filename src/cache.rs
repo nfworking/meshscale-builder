@@ -34,6 +34,15 @@ pub struct StaticCache {
     // One fill at a time bounds read buffers and coalesces concurrent misses.
     fill: Mutex<()>,
     reads: AtomicU64,
+    evictions: AtomicU64,
+}
+
+pub struct CacheSnapshot {
+    pub entries: usize,
+    pub bytes: u64,
+    pub capacity: u64,
+    pub fills: u64,
+    pub evictions: u64,
 }
 
 impl StaticCache {
@@ -48,7 +57,19 @@ impl StaticCache {
             state: Mutex::new(CacheState::default()),
             fill: Mutex::new(()),
             reads: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }))
+    }
+
+    pub async fn snapshot(&self) -> CacheSnapshot {
+        let state = self.state.lock().await;
+        CacheSnapshot {
+            entries: state.entries.len(),
+            bytes: state.bytes,
+            capacity: self.capacity,
+            fills: self.reads.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
     }
 
     async fn hit(&self, key: &str) -> Option<Bytes> {
@@ -65,22 +86,37 @@ impl StaticCache {
         self.hit(&format!("{key}:{}", object.sha256)).await
     }
 
+    #[cfg(test)]
     pub async fn get(
         &self,
         key: &str,
         path: &Path,
         object: &StaticObject,
     ) -> Result<Option<Bytes>> {
+        Ok(self
+            .lookup(key, path, object)
+            .await?
+            .map(|(bytes, _)| bytes))
+    }
+
+    /// Returns the bytes and whether they were already resident (`true`) or just read from disk.
+    pub async fn lookup(
+        &self,
+        key: &str,
+        path: &Path,
+        object: &StaticObject,
+    ) -> Result<Option<(Bytes, bool)>> {
         if self.capacity == 0 || object.bytes > self.max_file || object.bytes > self.capacity {
             return Ok(None);
         }
         let key = format!("{key}:{}", object.sha256);
         if let Some(bytes) = self.hit(&key).await {
-            return Ok(Some(bytes));
+            return Ok(Some((bytes, true)));
         }
         let _fill = self.fill.lock().await;
+        // A concurrent miss for the same object may have filled the entry while waiting.
         if let Some(bytes) = self.hit(&key).await {
-            return Ok(Some(bytes));
+            return Ok(Some((bytes, true)));
         }
         {
             let mut state = self.state.lock().await;
@@ -97,6 +133,7 @@ impl StaticCache {
                         .expect("entry selected from map")
                         .bytes
                         .len() as u64;
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     break;
                 }
@@ -128,10 +165,9 @@ impl StaticCache {
                 touched: clock,
             },
         );
-        Ok(Some(bytes))
+        Ok(Some((bytes, false)))
     }
 }
-
 pub fn apply_metadata(response: &mut Response, object: &StaticObject) -> Result<()> {
     response
         .headers_mut()
@@ -240,8 +276,7 @@ pub fn response(
                 let length = bytes.len() as u64;
                 if start.is_empty() {
                     let suffix: u64 = end.parse().ok()?;
-                    (suffix > 0 && length > 0)
-                        .then(|| (length.saturating_sub(suffix), length - 1))
+                    (suffix > 0 && length > 0).then(|| (length.saturating_sub(suffix), length - 1))
                 } else {
                     let start: u64 = start.parse().ok()?;
                     let end = if end.is_empty() {
@@ -396,8 +431,12 @@ mod tests {
         headers.insert(header::RANGE, "bytes=0-1,4-5".parse()?);
         assert!(response(bytes, &Method::GET, &headers, &object)?.is_none());
         headers.insert(header::RANGE, "bytes=-1".parse()?);
-        assert_eq!(response(Bytes::new(), &Method::GET, &headers, &object)?.unwrap().status(),
-            StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response(Bytes::new(), &Method::GET, &headers, &object)?
+                .unwrap()
+                .status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
         Ok(())
     }
 }
