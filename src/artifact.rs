@@ -25,11 +25,11 @@ pub fn create_output(
         );
     }
 
-    let next_server_trace = next_dir.join("next-server.js.nft.json");
-    if !next_server_trace.is_file() {
+    let adapter_metadata = next_dir.join("meshscale-adapter.json");
+    if !adapter_metadata.is_file() {
         bail!(
-            "Next.js production server trace was not produced: {}",
-            next_server_trace.display()
+            "MeshScale Next.js adapter did not produce deployment metadata: {}",
+            adapter_metadata.display()
         );
     }
 
@@ -70,8 +70,8 @@ pub fn create_output(
         .with_context(|| format!("failed to create {}", static_dir.display()))?;
 
     let mut all_traced_files = collect_next_trace_files(&next_dir, &project_root)?;
-    if all_traced_files.contains_key(".meshscale-server.cjs") {
-        bail!("project trace conflicts with the generated .meshscale-server.cjs entrypoint");
+    if all_traced_files.contains_key("function-entry.cjs") {
+        bail!("project trace conflicts with the generated function-entry.cjs entrypoint");
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
     materialize_package_dependencies(&project_root, &mut all_traced_files)?;
@@ -84,10 +84,10 @@ pub fn create_output(
     copy_public_assets(project_dir, &static_dir)?;
     copy_next_static(project_dir, &static_dir)?;
     fs::write(
-        runtime_dir.join(".meshscale-server.cjs"),
-        include_str!("next_server.cjs"),
+        runtime_dir.join("function-entry.cjs"),
+        include_str!("function_entry.cjs"),
     )
-    .context("failed to write production Node entrypoint")?;
+    .context("failed to write MeshScale function entrypoint")?;
 
     let manifest = json!({
         "version": metadata.version,
@@ -192,11 +192,11 @@ fn collect_entrypoint_trace(
     files: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let mut entrypoint = tempfile::Builder::new()
-        .prefix(".meshscale-entrypoint-")
+        .prefix(".meshscale-function-entrypoint-")
         .suffix(".cjs")
         .tempfile_in(project_dir)
         .context("failed to stage production entrypoint for tracing")?;
-    entrypoint.write_all(include_bytes!("next_server.cjs"))?;
+    entrypoint.write_all(include_bytes!("function_entry.cjs"))?;
     entrypoint.flush()?;
     let entrypoint_source = entrypoint.path().canonicalize()?;
     let script = r#"
