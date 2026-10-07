@@ -42,6 +42,7 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
     );
 
     install_dependencies(&project_dir, package_manager)?;
+    install_adapter_runtime_dependency(&project_dir)?;
     run_build(&project_dir, package_manager, &package_json)?;
 
     let metadata = BuildMetadata {
@@ -243,6 +244,23 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
     run_command(executable, &args, project_dir, "dependency installation")
 }
 
+fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
+    let next_package = project_dir.join("node_modules").join("next").join("package.json");
+    let package: Value = serde_json::from_slice(
+        &fs::read(&next_package).with_context(|| format!("failed to read {}", next_package.display()))?,
+    )
+    .context("installed Next.js package.json is invalid")?;
+    let version = package
+        .get("version")
+        .and_then(Value::as_str)
+        .context("installed Next.js package.json is missing version")?;
+
+    let spec = format!("@next/routing@{version}");
+    let args = ["install", "--no-save", "--package-lock=false", "--ignore-scripts", spec.as_str()];
+    info!(command = %format_command("npm", &args), "installing Next.js adapter routing runtime");
+    run_command("npm", &args, project_dir, "adapter routing installation")
+}
+
 fn run_build(
     project_dir: &Path,
     package_manager: PackageManager,
@@ -260,12 +278,47 @@ fn run_build(
     let executable = package_manager.executable();
     let args = package_manager.build_args();
 
+    let adapter_path = project_dir.join(".meshscale-next-adapter.cjs");
+    fs::write(&adapter_path, include_str!("next_adapter.cjs"))
+        .context("failed to stage MeshScale Next.js adapter")?;
+
     info!(
         command = %format_command(executable, &args),
-        "building application with the project's normal Next.js build"
+        adapter = %adapter_path.display(),
+        "building application through the MeshScale Next.js adapter"
     );
 
-    run_command(executable, &args, project_dir, "application build")
+    let mut command = Command::new(executable);
+    crate::upload::remove_credentials(&mut command);
+    let status = command
+        .args(&args)
+        .current_dir(project_dir)
+        .env("CI", "true")
+        .env("NEXT_ADAPTER_PATH", &adapter_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to start application build: {}",
+                format_command(executable, &args)
+            )
+        });
+
+    let _ = fs::remove_file(&adapter_path);
+    let status = status?;
+    if !status.success() {
+        bail!(
+            "application build failed with exit status {}",
+            status.code().map_or_else(
+                || "terminated by signal".to_owned(),
+                |code| code.to_string()
+            )
+        );
+    }
+
+    Ok(())
 }
 
 fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
