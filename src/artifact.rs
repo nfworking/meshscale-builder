@@ -361,6 +361,27 @@ fn collect_adapter_assets(
             continue;
         };
         for output in outputs {
+            // Adapter outputs point directly at the server module that handles
+            // the route. Next's NFT traces do not necessarily include this
+            // adapter-owned output file, so it must be copied explicitly.
+            if let Some(file_path) = output.get("filePath").and_then(serde_json::Value::as_str) {
+                let source = project_dir
+                    .join(file_path)
+                    .canonicalize()
+                    .with_context(|| format!("adapter output does not exist: {file_path}"))?;
+                let logical = Path::new(file_path);
+                ensure!(
+                    logical.is_relative()
+                        && logical.components().all(|component| {
+                            matches!(component, std::path::Component::Normal(_))
+                        }),
+                    "invalid adapter output path: {}",
+                    logical.display()
+                );
+                let logical = logical.to_string_lossy().replace('\\', "/");
+                collect_trace_entry(files, project_root, &logical, &source)?;
+            }
+
             let Some(assets) = output.get("assets").and_then(serde_json::Value::as_object) else {
                 continue;
             };
