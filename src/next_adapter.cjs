@@ -85,24 +85,4 @@ const adapter = {
           pathname: output.pathname,
           parentOutputId: output.parentOutputId,
           route: output.route,
-          response: output.response,
-          compute: output.compute,
-          fallback: output.fallback
-            ? {
-                filePath: relativeToProject(projectDir, output.fallback.filePath),
-                initialStatus: output.fallback.initialStatus,
-                initialHeaders: output.fallback.initialHeaders,
-                initialExpiration: output.fallback.initialExpiration,
-                initialRevalidate: output.fallback.initialRevalidate,
-              }
-            : undefined,
         })),
-      },
-    };
-
-    const destination = path.join(projectDir, '.next', 'meshscale-adapter.json');
-    fs.writeFileSync(destination, JSON.stringify(metadata, null, 2) + '\n');
-  },
-};
-
-module.exports = adapter;
