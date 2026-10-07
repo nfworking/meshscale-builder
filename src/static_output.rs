@@ -1,5 +1,5 @@
 use crate::{
-    manifest::{Archive, Manifest, Platform, Server, StaticObject},
+    manifest::{Manifest, Platform, Server, StaticObject},
     routing::{QueryPolicy, Routing},
 };
 use anyhow::{Context, Result, ensure};
@@ -139,11 +139,6 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
     });
     manifest.server = Some(Server {
         target_id: manifest.target_id(),
-    });
-    manifest.archive = Some(Archive {
-        filename: manifest.archive_name()?,
-        format: "zip".into(),
-        excludes: vec!["static/".into()],
     });
     let mut routing = Routing::new();
     let mut reasons = Vec::new();

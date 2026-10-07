@@ -18,8 +18,9 @@ pub struct Manifest {
     pub routing: Option<crate::routing::Routing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Server>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archive: Option<Archive>,
+    /// Ignored: manifests built before server ZIP packaging was removed still carry this field.
+    #[serde(default, rename = "archive", skip_serializing)]
+    _legacy_archive: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 }
@@ -90,14 +91,6 @@ pub struct Storage {
 #[serde(deny_unknown_fields)]
 pub struct Server {
     pub target_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Archive {
-    pub filename: Option<String>,
-    pub format: String,
-    pub excludes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -272,18 +265,6 @@ impl Manifest {
             target.target_id == self.target_id(),
             "server target does not match deployment"
         );
-        let archive = self
-            .archive
-            .as_ref()
-            .context("missing server archive descriptor")?;
-        ensure!(
-            archive.format == "zip" && archive.excludes == ["static/"],
-            "unsupported archive layout"
-        );
-        ensure!(
-            archive.filename == self.archive_name()?,
-            "archive filename does not match deployment"
-        );
         for (key, object) in &self.r#static.objects {
             validate_relative(key)?;
             ensure!(
@@ -362,17 +343,6 @@ impl Manifest {
         Ok(format!("{org}/{project}/{}", self.deployment.id))
     }
 
-    pub fn archive_name(&self) -> Result<Option<String>> {
-        self.deployment
-            .project_id
-            .as_ref()
-            .map(|project| {
-                crate::upload::validate_id("project-id", project)?;
-                Ok(format!("server_{}_{}.zip", self.deployment.commit, project))
-            })
-            .transpose()
-    }
-
     pub fn bind(&mut self, org: &str, project: &str, bucket: Option<&str>) -> Result<()> {
         for (stored, supplied) in [
             (&self.deployment.org_id, org),
@@ -388,10 +358,6 @@ impl Manifest {
         self.server = Some(Server {
             target_id: self.target_id(),
         });
-        self.archive
-            .as_mut()
-            .context("missing archive descriptor")?
-            .filename = self.archive_name()?;
         if let Some(bucket) = bucket {
             let storage = Storage {
                 provider: "r2".to_owned(),

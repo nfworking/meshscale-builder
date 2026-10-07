@@ -19,6 +19,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio_util::io::ReaderStream;
+use walkdir::WalkDir;
 
 use crate::{artifact, manifest};
 
@@ -88,7 +89,6 @@ pub struct UploadResult {
     pub prefix: String,
     pub files: usize,
     pub bytes: u64,
-    pub archive: crate::archive::ArchiveResult,
     pub manifest_key: String,
 }
 
@@ -255,10 +255,58 @@ struct UploadFile {
     bytes: u64,
 }
 
-fn snapshot(output: &Path, destination: &Path) -> Result<Vec<UploadFile>> {
-    crate::archive::snapshot(output, destination)?;
-    let manifest = manifest::load(destination)?;
-    crate::static_output::verify_inventory(destination, &manifest)?;
+/// Validates the entire artifact tree, copies only `static/` into the snapshot and verifies it
+/// against the manifest, so later changes cannot affect what is uploaded.
+fn snapshot(
+    output: &Path,
+    destination: &Path,
+    manifest: &manifest::Manifest,
+) -> Result<Vec<UploadFile>> {
+    let root = output.canonicalize()?;
+    for entry in WalkDir::new(output).follow_links(false) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(output)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let name = relative
+            .to_str()
+            .context("artifact path must be UTF-8")?
+            .replace('\\', "/");
+        manifest::validate_relative(&name)?;
+        ensure!(
+            matches!(
+                name.split('/').next(),
+                Some("runtime" | "static" | "manifest.json")
+            ),
+            "unexpected artifact entry {name}"
+        );
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            !metadata.file_type().is_symlink() && fs::read_link(entry.path()).is_err(),
+            "artifact contains a link: {name}"
+        );
+        ensure!(
+            entry.path().canonicalize()?.starts_with(&root),
+            "artifact escapes output"
+        );
+        if name != "static" && !name.starts_with("static/") {
+            continue;
+        }
+        if metadata.is_dir() {
+            fs::create_dir_all(destination.join(relative))?;
+        } else {
+            ensure!(metadata.is_file(), "unsupported artifact entry {name}");
+            fs::create_dir_all(
+                destination
+                    .join(relative)
+                    .parent()
+                    .context("snapshot path has no parent")?,
+            )?;
+            fs::copy(entry.path(), destination.join(relative))?;
+        }
+    }
+    crate::static_output::verify_inventory(destination, manifest)?;
     manifest
         .r#static
         .objects
@@ -285,13 +333,10 @@ async fn upload_async(
 ) -> Result<UploadResult> {
     let (org, project) = destination.validate()?;
     artifact::validate_output(output)?;
-    manifest::load(output)?.validate_v2()?;
-    let staging =
-        std::sync::Arc::new(tempfile::TempDir::new().context("failed to create upload snapshot")?);
-    let files = snapshot(output, staging.path())?;
-    // Validate the snapshot, not just the live directory, before publishing anything.
-    artifact::validate_output(staging.path())?;
-    let mut manifest = manifest::load(staging.path())?;
+    let mut manifest = manifest::load(output)?;
+    manifest.validate_v2()?;
+    let staging = tempfile::TempDir::new().context("failed to create upload snapshot")?;
+    let files = snapshot(output, staging.path(), &manifest)?;
     validate_id("build-id", &manifest.deployment.id)?;
     if let Some(id) = asserted_build_id {
         ensure!(
@@ -316,7 +361,6 @@ async fn upload_async(
     }
     manifest.bind(org, project, Some(&config.bucket))?;
     manifest::write(staging.path(), &manifest)?;
-    let archive_destination = crate::archive::destination(output, &manifest)?;
     let prefix = format!("{org}/{project}/{}/", manifest.deployment.id);
     let manifest_file = UploadFile {
         relative: "manifest.json".into(),
@@ -372,23 +416,16 @@ async fn upload_async(
             completed_files += 1;
             report_progress(completed_bytes, total_bytes, completed_files, total_files);
         }
-        eprintln!("Static transfer complete; packaging local server ZIP");
-        let source = staging.clone();
-        let archive_result = tokio::task::spawn_blocking(move || {
-            crate::archive::create(source.path(), &archive_destination)
-        })
-        .await
-        .context("server archive task failed")??;
-        // The manifest is published only after both static transfer and ZIP succeed.
+        // The manifest is published last, only after every static object is acknowledged.
         manifest::write(output, &manifest)?;
         uploader
             .put_file(&format!("{prefix}manifest.json"), &manifest_file)
             .await?;
         report_progress(total_bytes, total_bytes, total_files, total_files);
-        Ok::<_, anyhow::Error>(archive_result)
+        Ok::<_, anyhow::Error>(())
     }
     .await;
-    let archive_result = result.with_context(|| format!(
+    result.with_context(|| format!(
         "upload to {prefix} failed; objects are never overwritten or automatically deleted. Use a new build ID after a partial/uncertain upload"
     ))?;
     Ok(UploadResult {
@@ -396,7 +433,6 @@ async fn upload_async(
         prefix,
         files: total_files,
         bytes: total_bytes,
-        archive: archive_result,
         manifest_key: format!("{}/manifest.json", manifest.bound_prefix()?),
     })
 }
@@ -602,7 +638,6 @@ pub(crate) mod tests {
         fail_asset: bool,
         fail_manifest: bool,
         signature_failure: bool,
-        archive_conflict_on_reserve: Option<PathBuf>,
         active: usize,
         max_active: usize,
     }
@@ -668,11 +703,6 @@ pub(crate) mod tests {
             {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            if path.ends_with(RESERVATION)
-                && let Some(path) = &state.archive_conflict_on_reserve
-            {
-                fs::write(path, "concurrent archive").unwrap();
-            }
             state.active += 1;
             state.max_active = state.max_active.max(state.active);
             assert!(state.objects.insert(path.clone(), bytes.to_vec()).is_none());
@@ -712,10 +742,7 @@ pub(crate) mod tests {
             upload_async(output, &destination, None, config(server.endpoint.clone())).await?;
         let store = server.store.lock().unwrap();
         ensure!(
-            !store
-                .objects
-                .keys()
-                .any(|key| key.contains("/runtime/") || key.ends_with(".zip")),
+            !store.objects.keys().any(|key| key.contains("/runtime/")),
             "runtime leaked to R2"
         );
         ensure!(
@@ -803,11 +830,6 @@ pub(crate) mod tests {
         metadata.server = Some(manifest::Server {
             target_id: metadata.target_id(),
         });
-        metadata.archive = Some(manifest::Archive {
-            filename: metadata.archive_name()?,
-            format: "zip".into(),
-            excludes: vec!["static/".into()],
-        });
         metadata.routing = Some(crate::routing::Routing::new());
         for file in ["a +#%.txt", "empty.txt", "bad.txt"] {
             let object = crate::static_output::object(
@@ -870,35 +892,18 @@ pub(crate) mod tests {
             !store
                 .objects
                 .keys()
-                .any(|key| key.contains("/runtime/") || key.ends_with(".zip"))
+                .any(|key| key.contains("/runtime/") || key.contains(".zip"))
         );
-        let mut archive = zip::ZipArchive::new(fs::File::open(&result.archive.path)?)?;
-        assert!(archive.by_name("runtime/.next/static/keep.js").is_ok());
-        assert!(archive.by_name("runtime/empty/")?.is_dir());
-        assert!(archive.by_name("static/bad.txt").is_err());
-        let mut archived_manifest = Vec::new();
-        std::io::Read::read_to_end(
-            &mut archive.by_name("manifest.json")?,
-            &mut archived_manifest,
-        )?;
-        assert_eq!(&archived_manifest, remote_manifest);
-        assert!(
-            result
-                .archive
-                .path
+        assert!(!String::from_utf8_lossy(remote_manifest).contains("\"archive\""));
+        // Uploading must not modify the artifact's runtime or create a server archive.
+        assert!(output.path().join("runtime/.next/static/keep.js").is_file());
+        assert!(fs::read_dir(output.path().parent().unwrap())?.all(|entry| {
+            !entry
+                .unwrap()
                 .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("server_1234567890abcdef1234567890abcdef12345678_project_456")
-        );
-        assert!(crate::archive::create(output.path(), &result.archive.path).is_err());
-        let second = crate::archive::create(
-            output.path(),
-            &output.path().parent().unwrap().join("second.zip"),
-        )?;
-        assert_eq!(result.archive.sha256, second.sha256);
-        assert_eq!(result.archive.bytes, second.bytes);
+                .to_string_lossy()
+                .ends_with(".zip")
+        }));
         Ok(())
     }
 
@@ -1002,7 +1007,7 @@ pub(crate) mod tests {
     async fn existing_deployment_cannot_be_overwritten() -> Result<()> {
         let server = mock_server().await?;
         let output = fixture()?;
-        let first = upload_async(
+        upload_async(
             output.path(),
             &destination(),
             None,
@@ -1010,7 +1015,6 @@ pub(crate) mod tests {
         )
         .await?;
         let before = server.store.lock().unwrap().objects.clone();
-        fs::remove_file(&first.archive.path)?;
         let error = upload_async(
             output.path(),
             &destination(),
@@ -1059,31 +1063,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn packaging_failure_after_static_upload_never_publishes_manifest() -> Result<()> {
-        let server = mock_server().await?;
-        let output = fixture()?;
-        let original = fs::read(output.path().join("manifest.json"))?;
-        let destination =
-            crate::archive::destination(output.path(), &manifest::load(output.path())?)?;
-        server.store.lock().unwrap().archive_conflict_on_reserve = Some(destination.clone());
-        let error = upload_async(
-            output.path(),
-            &self::destination(),
-            None,
-            config(server.endpoint.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("archive already exists"));
-        let store = server.store.lock().unwrap();
-        assert_eq!(store.objects.len(), 4);
-        assert!(!store.order.iter().any(|key| key.ends_with("manifest.json")));
-        assert_eq!(fs::read(output.path().join("manifest.json"))?, original);
-        assert_eq!(fs::read_to_string(destination)?, "concurrent archive");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn validates_before_any_network_write() -> Result<()> {
         let server = mock_server().await?;
         let output = fixture()?;
@@ -1128,22 +1107,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn archive_conflict_and_legacy_artifacts_fail_before_remote_reservation() -> Result<()> {
+    async fn legacy_artifacts_fail_before_remote_reservation() -> Result<()> {
         let server = mock_server().await?;
         let output = fixture()?;
         let metadata = manifest::load(output.path())?;
-        let destination = crate::archive::destination(output.path(), &metadata)?;
-        fs::write(&destination, "existing archive")?;
-        let error = upload_async(
-            output.path(),
-            &self::destination(),
-            None,
-            config(server.endpoint.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("archive already exists"));
-        fs::remove_file(&destination)?;
         let mut legacy = metadata;
         legacy.version = 1;
         manifest::write(output.path(), &legacy)?;

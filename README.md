@@ -21,7 +21,7 @@ The implemented pipeline covers building, manifest-driven local execution, stati
 11. Validate that the output contains no symbolic links or Windows junction/reparse-point links.
 12. Derive a version-2 routing contract and inventory eligible static assets and prerendered responses.
 13. Upload static objects to an immutable R2 prefix (unless `--no-upload` is set).
-14. Package the server as a local ZIP, then publish the finalized manifest last.
+14. Publish the finalized manifest last. The server runtime stays in the local output directory and is not packaged or uploaded.
 
 The builder does **not** modify next.config.* and does **not** force output: "standalone".
 
@@ -88,7 +88,7 @@ The output defaults to .meshscale/output and can be changed with --output.
 
 Build uploads by default and requires organization/project IDs and R2 configuration. It checks those settings before cloning/installing. For credential-free local build/run testing, append `--no-upload`; organization/project IDs are optional in that mode (but must be supplied together). Build records supplied IDs in `manifest.json`.
 
-Build success JSON includes an `upload` object with bucket, prefix, manifest key, uploaded file count/bytes and a local archive receipt (path, bytes, SHA-256); it is `null` when upload is disabled. If upload fails after a successful build, the command fails but preserves the local artifact and reports its output path. `build_time_ms` includes upload and packaging time when enabled. Logs and progress go to stderr; result JSON goes to stdout.
+Build success JSON includes an `upload` object with bucket, prefix, manifest key, and uploaded file count/bytes; it is `null` when upload is disabled. If upload fails after a successful build, the command fails but preserves the local artifact and reports its output path. `build_time_ms` includes upload time when enabled. Logs and progress go to stderr; result JSON goes to stdout.
 
 ## Local runner (phase D)
 
@@ -102,7 +102,7 @@ From the source checkout, use `cargo run -- run .meshscale/output`.
 
 The runner validates the Next.js/Node manifest, required paths and link-free artifact before starting anything. Version-2 artifacts also undergo full static inventory/digest verification and OS, architecture and Node ABI checks. Node must be on PATH. Only run trusted artifacts: their Node code executes with your user privileges.
 
-The Rust HTTP router listens at `http://localhost:3000` (IPv4 loopback). It spawns the manifest's entrypoint with its working directory and arguments, running the Next.js production server on `127.0.0.1:3100`. It waits up to 30 seconds for Node to listen; occupied ports, invalid manifests, startup failures and unexpected Node exits fail explicitly. Ctrl+C stops accepting requests, allows up to five seconds for active requests, then terminates and reaps the Node child.
+The Rust HTTP router listens at `http://localhost:3000` (IPv4 loopback). It spawns the manifest's entrypoint with its working directory and arguments, running the Next.js production server on `127.0.0.1:3100`. It waits up to 60 seconds for Node to accept connections, probing every ~100 ms with a 500 ms per-probe limit. A startup failure reports the number of probes and the last probe error; occupied ports, invalid manifests, startup failures and unexpected Node exits fail explicitly. Ctrl+C stops accepting requests, allows up to five seconds for active requests, then terminates and reaps the Node child.
 
 The runner also accepts the previous version-1 manifest layout using `node_modules/next/dist/bin/next` with `["start"]`, provided the artifact actually contains that CLI and its dependencies. Rebuild older incomplete artifacts to get the new production entrypoint.
 
@@ -137,7 +137,7 @@ meshscale-builder run .meshscale/output --static-cache-mib 0
 
 When enabled, the per-file limit must be positive and no larger than the total. The budget bounds cache-owned payload and one fill buffer, not total process RSS: active response references, metadata, HTTP buffers and Node memory are additional. Keep artifacts immutable while running; restart/rebuild after changes. Version-1 artifacts retain legacy file-existence streaming without this cache.
 
-The runner can also start an extracted server ZIP with no top-level `static/`; all requests then go to Next.js, using retained runtime fallback files. It does not contact R2.
+The runner can also start an output directory with no top-level `static/`; all requests then go to Next.js, using retained runtime fallback files. It does not contact R2.
 
 ### Request and cache statistics
 
@@ -164,7 +164,7 @@ A `stats` summary line (request totals per source, cache hit rate, bytes served 
 
 The builder excludes `.next/cache`, `.next/standalone` and build-only `.nft.json` manifests from the copied Next.js tree. It also avoids walking an already collected dependency path again and avoids re-copying traced `.next` entries during the runtime-tree copy.
 
-This is deliberately conservative: traced dependencies (including complete traced package directories), source maps and generated HTML/data files are retained because arbitrary pruning can break runtime imports or routes. `.next/static` remains in the runtime as well as the edge-facing `static/_next/static` tree so the normal Next.js server remains functional when handling requests itself. Server delivery uses a compressed ZIP, while R2 receives only static objects and metadata, rather than thousands of runtime dependencies. No hard links or cross-path package deduplication are introduced. Startup tracing may add dependencies missing from older, incomplete artifacts; savings depend on the application and these changes do not promise a fixed percentage reduction.
+This is deliberately conservative: traced dependencies (including complete traced package directories), source maps and generated HTML/data files are retained because arbitrary pruning can break runtime imports or routes. `.next/static` remains in the runtime as well as the edge-facing `static/_next/static` tree so the normal Next.js server remains functional when handling requests itself. R2 receives only static objects and metadata, rather than thousands of runtime dependencies, and the upload snapshot copies only `static/`. No hard links or cross-path package deduplication are introduced. Startup tracing may add dependencies missing from older, incomplete artifacts; savings depend on the application and these changes do not promise a fixed percentage reduction.
 
 ## Upload (phase E)
 
@@ -186,17 +186,7 @@ org_123/project_456/build_123/
     static/_next/...
 ~~~
 
-No runtime file or server ZIP is uploaded to R2. The ZIP is written beside the output directory as `server_<full-commit-hash>_<project-id>.zip`.
-
-### Independent server packaging
-
-~~~powershell
-.\meshscale-builder.exe package .meshscale\output --project-id project_456
-~~~
-
-No Cloudflare credentials are required. This snapshots and validates a version-2 output, binds an unbound project ID in the packaged manifest, and emits a JSON archive receipt. It does not change the original local manifest. The archive root contains `manifest.json` and `runtime/`, including empty directories and runtime fallback assets, but never top-level `static/`. Entries have deterministic order/timestamps, Deflate compression, Unix permissions where available and ZIP64 when needed. Identical snapshot bytes produce identical ZIP bytes.
-
-Archive filenames are never overwritten. A second package/upload for the same commit/project must use a different output parent, even with a different build ID. Upload rejects known filename conflicts before remote writes.
+No runtime files are uploaded to R2. The server runtime remains in the local output directory; there is no ZIP/package step.
 
 ### Credentials and dotenv
 
@@ -227,21 +217,21 @@ Dotenv files are ignored by Git (except the example), loaded without modifying p
 
 Before making network writes, the uploader validates the artifact and takes a temporary on-disk snapshot so later changes cannot affect upload/packaging. It verifies the static inventory and rejects links, dotenv files, unsupported entries and unexpected top-level files. Only inventoried static objects and `manifest.json` are uploaded.
 
-It first creates `_upload.json` as a reservation using `If-None-Match: *`. Every other object is also create-only. Static files stream with up to four concurrent requests and manifest content types/cache policies. After static transfer, the builder creates and verifies the local server ZIP, finalizes the local manifest, and uploads `manifest.json` **last**. Its bytes exactly match the archived root manifest. A remote manifest means static publication and local packaging succeeded, **not** that a server is deployed or production traffic has been activated.
+It first creates `_upload.json` as a reservation using `If-None-Match: *`. Every other object is also create-only. Static files stream with up to four concurrent requests and manifest content types/cache policies. After static transfer, the builder finalizes the local manifest and uploads `manifest.json` **last**; its bytes match the local `manifest.json`. A remote manifest means static publication succeeded, **not** that a server is deployed or production traffic has been activated.
 
 Object-key path segments are RFC 3986 percent-encoded before signing and sending, including brackets in Next.js filenames (such as `[root-of-the-server]`), plus signs and Unicode. This changes the HTTP representation, not the stored object key. R2 failures report the HTTP status, a bounded error code (for example `SignatureDoesNotMatch` or `AccessDenied`) and request ID when available. Raw response XML is not logged because signing errors can echo sensitive request details.
 
-Progress is reported as `Upload 42.3% (123/456 files, ... bytes)` to stderr, based on static-plus-manifest bytes acknowledged by R2 (not runtime/ZIP bytes or the reservation). It starts at 0% after reserving the prefix and reaches 100% only after the manifest upload succeeds. Large files advance when acknowledged; ZIP packaging has a separate stage message.
+Progress is reported as `Upload 42.3% (123/456 files, ... bytes)` to stderr, based on static-plus-manifest bytes acknowledged by R2 (not runtime bytes or the reservation). It starts at 0% after reserving the prefix and reaches 100% only after the manifest upload succeeds. Large files advance when acknowledged.
 
 Existing deployments cannot be overwritten, including by concurrent uploaders. Failures/cancellation leave the reserved prefix and any already uploaded objects intact: there is no automatic deletion, overwrite, resume or retry with the same ID. Use a fresh build ID and rebuild after a partial or uncertain upload; orphaned prefixes can be cleaned up separately. A local artifact built with `--no-upload` can be uploaded once later.
 
-This version uses single-object PUTs, rejects static objects larger than 5 GiB before reserving a prefix, and has a five-minute timeout per request. Version-1 artifacts must be rebuilt before upload/package; local `run` remains backward compatible. Multipart upload, content-addressed deduplication, edge workers, server deployment and control-plane production aliases are intentionally not implemented. This is a MeshScale contract inspired by static/compute separation, not Vercel Build Output API compatibility.
+This version uses single-object PUTs, rejects static objects larger than 5 GiB before reserving a prefix, and has a five-minute timeout per request. Version-1 artifacts must be rebuilt before upload; local `run` remains backward compatible. Multipart upload, content-addressed deduplication, edge workers, server deployment and control-plane production aliases are intentionally not implemented. This is a MeshScale contract inspired by static/compute separation, not Vercel Build Output API compatibility.
 
 ## Validation
 
 `cargo test` covers artifact materialization, size/copy exclusions, manifest validation, static routing, proxy semantics, Node startup failures, port conflicts and child cleanup. Uploader tests use a local mock S3 endpoint to verify signing headers, exact keys/bytes, manifest-last publication, immutable conflicts, parallel uploaders, failures, progress and dotenv precedence without Cloudflare credentials. The startup-tracing and Node lifecycle tests require `node` on PATH. Use `cargo clippy --all-targets -- -D warnings` for linting.
 
-The opt-in integration tests install/build real npm and pnpm Next.js applications, delete their source checkouts, check dynamic HTML, manifest-served generated HTML, saved configuration, a POST API and public assets, then publish to mock S3, extract the resulting server ZIP and start it without top-level static files:
+The opt-in integration tests install/build real npm and pnpm Next.js applications, delete their source checkouts, check dynamic HTML, manifest-served generated HTML, saved configuration, a POST API and public assets, then publish to mock S3 and check that no runtime objects are sent and the manifest is published last:
 
 ~~~text
 cargo test runtime::tests::runs_relocated_nextjs_application -- --ignored --nocapture
@@ -249,12 +239,6 @@ cargo test runtime::tests::runs_relocated_pnpm_nextjs_application -- --ignored -
 ~~~
 
 These require npm, Node and network access. The pnpm test obtains pnpm 10 through `npm exec` and exercises an isolated pnpm dependency layout.
-
-For a focused npm/pnpm schema, static HTML digest and RSC forwarding check without repeating ZIP extraction:
-
-~~~text
-cargo test runtime::tests::checks_real_static_contract -- --ignored --nocapture
-~~~
 
 ## Next.js tracing
 

@@ -207,6 +207,9 @@ async fn run_with_shutdown(
         tokio::pin!(server);
         info!(url = %format!("http://localhost:{}", args.port), runtime = %backend,
             static_cache_bytes = cache_bytes, static_cache_max_file_bytes = max_file, "local runner ready");
+        if cache_bytes == 0 {
+            info!("static cache is disabled (--static-cache-mib 0); every static file is streamed from disk");
+        }
         tokio::select! {
             result = &mut server => result.context("local HTTP server failed"),
             status = child.wait() => {
@@ -253,20 +256,41 @@ async fn stop_runtime(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
+const RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn wait_for_runtime(child: &mut Child, address: SocketAddr) -> Result<()> {
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(status) = child.try_wait().context("failed to inspect Node runtime")? {
-                bail!("Node runtime exited before becoming ready: {status}");
-            }
-            if TcpStream::connect(address).await.is_ok() {
+    let started = Instant::now();
+    let mut attempts = 0u32;
+    let mut last_probe = "no probe completed".to_owned();
+    // Each probe is bounded so one stalled connect (which Windows can hold for seconds) never
+    // consumes the whole startup window.
+    while started.elapsed() < RUNTIME_STARTUP_TIMEOUT {
+        if let Some(status) = child.try_wait().context("failed to inspect Node runtime")? {
+            bail!("Node runtime exited before becoming ready: {status}");
+        }
+        attempts += 1;
+        match timeout(RUNTIME_PROBE_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(_)) => {
+                info!(
+                    attempts,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "Node runtime is accepting connections"
+                );
                 return Ok(());
             }
-            sleep(Duration::from_millis(100)).await;
+            Ok(Err(error)) => last_probe = format!("connect failed: {error}"),
+            Err(_) => last_probe = format!("connect timed out after {RUNTIME_PROBE_TIMEOUT:?}"),
         }
-    })
-    .await
-    .context("Node runtime did not become ready within 30 seconds")?
+        sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "Node runtime did not accept connections on {address} within {} seconds \
+         ({attempts} probes; last probe: {last_probe}). If Next.js printed Ready, \
+         another process, firewall or security tool may be blocking loopback port {}",
+        RUNTIME_STARTUP_TIMEOUT.as_secs(),
+        address.port()
+    )
 }
 
 fn asset_relative_path(path: &str) -> Result<PathBuf> {
@@ -1246,27 +1270,17 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
     #[tokio::test]
     #[ignore = "installs and builds a real Next.js fixture; requires npm, Node and network access"]
     async fn runs_relocated_nextjs_application() -> Result<()> {
-        run_relocated_nextjs_application(crate::PackageManager::Npm, true).await
+        run_relocated_nextjs_application(crate::PackageManager::Npm).await
     }
 
     #[tokio::test]
     #[ignore = "installs and builds a pnpm Next.js fixture; requires npm, Node and network access"]
     async fn runs_relocated_pnpm_nextjs_application() -> Result<()> {
-        run_relocated_nextjs_application(crate::PackageManager::Pnpm, true).await
-    }
-
-    #[tokio::test]
-    #[ignore = "builds real npm and pnpm fixtures; checks static routing/schema/RSC without repeating ZIP verification"]
-    async fn checks_real_static_contract() -> Result<()> {
-        for manager in [crate::PackageManager::Npm, crate::PackageManager::Pnpm] {
-            run_relocated_nextjs_application(manager, false).await?;
-        }
-        Ok(())
+        run_relocated_nextjs_application(crate::PackageManager::Pnpm).await
     }
 
     async fn run_relocated_nextjs_application(
         package_manager: crate::PackageManager,
-        verify_archive: bool,
     ) -> Result<()> {
         let workspace = TempDir::new()?;
         let project = workspace.path().join("repo");
@@ -1527,82 +1541,7 @@ http.createServer((req, res) => res.end('ready')).listen(port, '127.0.0.1', () =
         let _ = stop.send(());
         timeout(Duration::from_secs(10), task).await???;
         result??;
-        if !verify_archive {
-            return Ok(());
-        }
-        let publication = crate::upload::tests::publish_real_fixture(&output).await?;
-        let extracted = workspace.path().join("server-only");
-        let mut archive = zip::ZipArchive::new(fs::File::open(&publication.archive.path)?)?;
-        archive.extract(&extracted)?;
-        ensure!(
-            !extracted.join("static").exists(),
-            "ZIP contains top-level static"
-        );
-        let metadata = manifest::load_server(&extracted)?;
-        ensure!(
-            metadata.r#static.storage.is_some(),
-            "archived manifest missing publication binding"
-        );
-        let fallback_file =
-            walkdir::WalkDir::new(extracted.join("runtime").join(".next").join("static"))
-                .into_iter()
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .into_iter()
-                .find(|entry| {
-                    entry.file_type().is_file()
-                        && entry.path().extension().is_some_and(|ext| ext == "js")
-                })
-                .context("bundle has no Next.js static fallback asset")?;
-        let fallback_path = format!(
-            "/_next/static/{}",
-            fallback_file
-                .path()
-                .strip_prefix(extracted.join("runtime").join(".next").join("static"))?
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
-        let port = available_port().await?;
-        let runtime_port = available_port().await?;
-        let (stop, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(run_with_shutdown(
-            RunArgs {
-                output: extracted,
-                port,
-                runtime_port,
-                static_cache_mib: 256,
-                static_cache_max_file_mib: 16,
-            },
-            async { stopped.await.context("test shutdown sender dropped") },
-        ));
-        let result = timeout(Duration::from_secs(40), async {
-            loop {
-                if TcpStream::connect(loopback(port)).await.is_ok() {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-            let client = client();
-            for path in ["/", "/about", fallback_path.as_str()] {
-                let response = client
-                    .request(request(
-                        "GET",
-                        &format!("http://127.0.0.1:{port}{path}"),
-                        "",
-                    ))
-                    .await?;
-                ensure!(
-                    response.status() == StatusCode::OK,
-                    "extracted server failed for {path}: {}",
-                    response.status()
-                );
-                to_bytes(Body::new(response.into_body()), 16 * 1024 * 1024).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await;
-        let _ = stop.send(());
-        timeout(Duration::from_secs(10), task).await???;
-        result??;
+        crate::upload::tests::publish_real_fixture(&output).await?;
         Ok(())
     }
 }

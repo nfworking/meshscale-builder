@@ -118,9 +118,13 @@ impl Stats {
 
     pub fn log(&self, label: &str, cache: &CacheSnapshot) {
         let totals = self.totals();
-        let hit_rate = totals
-            .cache_hit_rate
-            .map_or_else(|| "n/a".to_owned(), |rate| format!("{rate:.1}%"));
+        let hit_rate = if cache.capacity == 0 {
+            "disabled".to_owned()
+        } else {
+            totals
+                .cache_hit_rate
+                .map_or_else(|| "n/a".to_owned(), |rate| format!("{rate:.1}%"))
+        };
         info!(
             uptime_s = self.started.elapsed().as_secs(),
             requests = totals.requests,

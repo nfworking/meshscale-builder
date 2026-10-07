@@ -4,7 +4,6 @@ use serde::Serialize;
 use std::{path::PathBuf, time::Instant};
 use tracing_subscriber::EnvFilter;
 
-mod archive;
 mod artifact;
 mod build;
 mod cache;
@@ -37,8 +36,6 @@ enum Commands {
     Run(runtime::RunArgs),
     /// Upload a previously built output to an immutable R2 deployment prefix.
     Upload(upload::UploadArgs),
-    /// Create a local server ZIP without uploading or requiring R2 credentials.
-    Package(archive::PackageArgs),
 }
 
 #[derive(Args, Debug)]
@@ -195,7 +192,6 @@ fn main() {
         Commands::Build(args) => run_build(args, cli.env_file.as_deref()),
         Commands::Run(args) => runtime::run(args),
         Commands::Upload(args) => upload::upload(args, cli.env_file.as_deref()),
-        Commands::Package(args) => archive::package(args),
     };
 
     if let Err(error) = result {
