@@ -155,13 +155,11 @@ class FunctionResponse extends Writable {
     this.statusMessage = undefined;
     this.headers = new Map();
     this.headersSent = false;
-    this.writableEnded = false;
     this._completion = new Promise((resolve, reject) => {
       this._resolveCompletion = resolve;
       this._rejectCompletion = reject;
     });
     this.once('finish', () => {
-      this.writableEnded = true;
       this._resolveCompletion();
     });
     this.once('error', (error) => this._rejectCompletion(error));
@@ -339,7 +337,10 @@ async function handleRequest(header, body) {
 async function dispatchFrame(header, body) {
   if (header.kind === 'request') {
     if (body.length !== header.length) throw new Error('function request body length mismatch');
-    await handleRequest(header, body);
+    void handleRequest(header, body).catch((error) => {
+      console.error('MeshScale function request failed:', error);
+      queueFrame({ kind: 'error', id: header.id, error: String(error), length: 0 }).catch(() => {});
+    });
     return;
   }
   throw new Error('unknown function protocol frame');
