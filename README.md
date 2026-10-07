@@ -30,6 +30,7 @@ The builder does **not** modify next.config.* and does **not** force output: "st
 ~~~text
 .meshscale/
 └── output/
+    ├── build.log
     ├── manifest.json
     ├── static/
     │   ├── _next/
@@ -92,7 +93,9 @@ $env:MESHSCALE_GITHUB_TOKEN = "github_pat_..."
 
 If both are supplied, `--access-token` takes precedence. The builder never logs the token and strips `MESHSCALE_GITHUB_TOKEN` before launching package-manager/build child processes. In MeshScale production, use a short-lived GitHub App installation token injected by the control plane rather than a long-lived personal token. GitHub recommends GitHub Apps for acting on behalf of an organization or another user and recommends least-privilege, expiring credentials. Fine-grained tokens used for repository access should be limited to the required repository and read-only contents access.
 
-Build success JSON includes an `upload` object with bucket, prefix, manifest key, and uploaded file count/bytes; it is `null` when upload is disabled. If upload fails after a successful build, the command fails but preserves the local artifact and reports its output path. `build_time_ms` includes upload time when enabled. Logs and progress go to stderr; result JSON goes to stdout.
+Build output is intentionally human-first rather than JSON. The CLI shows each major build stage with a spinner while it is running and a ✓/✗ result when it completes, followed by build ID, project ID, framework, package manager, static size, collective runtime size and a human-readable total build time. Upload progress remains visible when an upload is enabled.
+
+Every build also writes a detailed `build.log` to `.meshscale/output`. The file contains the full tracing output, command execution details and captured stdout/stderr from dependency installation, adapter setup and the application build. The terminal stays concise while the log remains suitable for debugging failed builds. The log is recreated for each build and is preserved while the artifact directories are replaced.
 
 ## Local runner
 
