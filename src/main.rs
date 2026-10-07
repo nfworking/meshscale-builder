@@ -203,15 +203,9 @@ fn init_build_logging(output: &Path) -> Result<FileLogGuard> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| "meshscale_builder=info".into());
 
+    // Build tracing is intentionally file-only. The terminal is owned exclusively
+    // by the custom BuildProgress UI below; internal stage logs must never leak into it.
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_target(false)
-                .without_time()
-                .with_ansi(true)
-                .compact(),
-        )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(file_writer)
