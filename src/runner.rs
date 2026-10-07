@@ -646,13 +646,28 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
         };
         let candidate = project.assets.join(object_key);
         match tokio::fs::canonicalize(&candidate).await {
-            Ok(path) if path.starts_with(&project.assets_root) && path.is_file() => {
-                match ServeFile::new(path).oneshot(request).await {
-                    Ok(response) => return response.map(Body::new).into_response(),
-                    Err(error) => match error {},
+            Ok(path) => {
+                let inside = path
+                    .strip_prefix(&project.assets_root)
+                    .is_ok();
+                if inside && path.is_file() {
+                    match ServeFile::new(path).oneshot(request).await {
+                        Ok(response) => return response.map(Body::new).into_response(),
+                        Err(error) => match error {},
+                    }
                 }
+
+                error!(
+                    object = object_key,
+                    candidate = %candidate.display(),
+                    resolved = %path.display(),
+                    static_root = %project.assets_root.display(),
+                    inside,
+                    is_file = path.is_file(),
+                    "static asset rejected"
+                );
+                return StatusCode::FORBIDDEN.into_response();
             }
-            Ok(_) => return StatusCode::FORBIDDEN.into_response(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 error!(error = %error, "failed to inspect static asset");
