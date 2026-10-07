@@ -267,14 +267,15 @@ fn install_adapter_runtime_dependency(
     // version is valid. Keep routing on the same stable major/minor line.
     let spec = adapter_routing_spec(version)?;
     let (executable, args) = adapter_routing_install_command(package_manager, &spec);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     info!(
         next_version = version,
         routing_spec = %spec,
         package_manager = package_manager.as_str(),
-        command = %format_command(executable, &args),
+        command = %format_command(executable, &arg_refs),
         "installing Next.js adapter routing runtime"
     );
-    run_command(executable, &args, project_dir, "adapter routing installation")
+    run_command(executable, &arg_refs, project_dir, "adapter routing installation")
 }
 
 fn adapter_routing_install_command(
