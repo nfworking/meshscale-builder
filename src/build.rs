@@ -71,7 +71,6 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
         ("git-repo", args.git_repo.as_str()),
         ("git-hash", args.git_hash.as_str()),
         ("git-branch", args.git_branch.as_str()),
-        ("access-token", args.access_token.as_str()),
         ("build-id", args.build_id.as_str()),
     ] {
         if value.trim().is_empty() {
@@ -103,40 +102,84 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_github_token(args: &BuildArgs) -> Result<Option<String>> {
+    if let Some(token) = args.access_token.as_deref() {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("--access-token cannot be empty");
+        }
+        return Ok(Some(token.to_owned()));
+    }
+
+    match std::env::var("MESHSCALE_GITHUB_TOKEN") {
+        Ok(token) => {
+            let token = token.trim();
+            if token.is_empty() {
+                bail!("MESHSCALE_GITHUB_TOKEN cannot be empty");
+            }
+            Ok(Some(token.to_owned()))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("MESHSCALE_GITHUB_TOKEN is not valid UTF-8")
+        }
+    }
+}
+
 fn clone_repository(args: &BuildArgs, destination: &Path) -> Result<Repository> {
     let url = format!(
         "https://github.com/{}/{}.git",
         args.git_username, args.git_repo
     );
-    let token = args.access_token.clone();
-
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |_url, _username_from_url, allowed_types| {
-        if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            Cred::userpass_plaintext("x-access-token", &token)
-        } else {
-            Err(git2::Error::from_str(
-                "GitHub HTTPS authentication requires USER_PASS_PLAINTEXT credentials",
-            ))
-        }
-    });
+    let token = resolve_github_token(args)?;
 
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
+    if let Some(token) = token.as_deref() {
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(move |_url, _username_from_url, allowed_types| {
+            if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
+                Cred::userpass_plaintext("x-access-token", token)
+            } else {
+                Err(git2::Error::from_str(
+                    "GitHub HTTPS authentication requires USER_PASS_PLAINTEXT credentials",
+                ))
+            }
+        });
+        fetch_options.remote_callbacks(callbacks);
+        info!(authenticated = true, "cloning GitHub repository with supplied credentials");
+    } else {
+        info!(authenticated = false, "cloning GitHub repository anonymously; private repositories require a GitHub token");
+    }
 
     let mut builder = RepoBuilder::new();
     builder.branch(&args.git_branch);
     builder.fetch_options(fetch_options);
 
     builder.clone(&url, destination).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to clone GitHub repository {}/{}: {} (class: {:?}, code: {:?})",
-            args.git_username,
-            args.git_repo,
-            error.message(),
-            error.class(),
-            error.code()
-        )
+        if error.code() == git2::ErrorCode::Auth {
+            if token.is_some() {
+                anyhow::anyhow!(
+                    "GitHub authentication failed for {}/{}; verify the token has read access to this repository",
+                    args.git_username,
+                    args.git_repo
+                )
+            } else {
+                anyhow::anyhow!(
+                    "GitHub repository {}/{} requires authentication; provide --access-token or MESHSCALE_GITHUB_TOKEN",
+                    args.git_username,
+                    args.git_repo
+                )
+            }
+        } else {
+            anyhow::anyhow!(
+                "failed to clone GitHub repository {}/{}: {} (class: {:?}, code: {:?})",
+                args.git_username,
+                args.git_repo,
+                error.message(),
+                error.class(),
+                error.code()
+            )
+        }
     })
 }
 
