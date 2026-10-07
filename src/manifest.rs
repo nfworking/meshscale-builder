@@ -430,16 +430,20 @@ pub fn resolve_path(output: &Path, relative: &Path) -> Result<PathBuf> {
     let root = output
         .canonicalize()
         .context("failed to resolve output directory")?;
-    let path = root
-        .join(relative)
-        .canonicalize()
-        .with_context(|| format!("manifest path does not exist: {}", relative.display()))?;
+    let path = root.join(relative).canonicalize().with_context(|| {
+        format!("manifest path does not exist: {}", relative.display())
+    })?;
     ensure!(
         path.starts_with(&root),
         "manifest path escapes output: {}",
         relative.display()
     );
-    Ok(path)
+
+    // Keep the canonical path for validation, but return the original lexical
+    // path to callers. On Windows, Path::canonicalize() can produce a
+    // \\?\\ verbatim path. Node.js does not reliably accept those paths as
+    // process entrypoints and can fail with EISDIR: lstat 'C:'.
+    Ok(output.join(relative))
 }
 
 #[cfg(test)]
