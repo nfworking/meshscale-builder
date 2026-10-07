@@ -242,7 +242,7 @@ impl Worker {
         }
     }
 
-    async fn invoke(&self, request: Request) -> Result<Response> {
+    async fn invoke(self: &Arc<Self>, request: Request, active: ActiveRequest) -> Result<Response> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = mpsc::channel(32);
         self.pending.lock().await.insert(id, sender);
@@ -304,32 +304,40 @@ impl Worker {
             response = response.header(name, value);
         }
 
-        let stream = unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Some(Ok(frame)) if frame.header.kind == "chunk" => {
-                        return Some((
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from(frame.body)),
-                            receiver,
-                        ));
-                    }
-                    Some(Ok(frame)) if frame.header.kind == "end" => return None,
-                    Some(Ok(frame)) if frame.header.kind == "error" => {
-                        let error = frame
-                            .header
-                            .error
-                            .unwrap_or_else(|| "function worker invocation failed".to_owned());
-                        return Some((Err(std::io::Error::other(error)), receiver));
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(error)) => return Some((Err(std::io::Error::other(error)), receiver)),
-                    None => {
-                        return Some((
-                            Err(std::io::Error::other(
-                                "function worker closed before ending the response",
-                            )),
-                            receiver,
-                        ));
+        let worker = self.clone();
+        let stream = unfold((receiver, active), move |(mut receiver, active)| {
+            let worker = worker.clone();
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Some(Ok(frame)) if frame.header.kind == "chunk" => {
+                            return Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from(frame.body)),
+                                (receiver, active),
+                            ));
+                        }
+                        Some(Ok(frame)) if frame.header.kind == "end" => {
+                            worker.pending.lock().await.remove(&id);
+                            drop(active);
+                            return None;
+                        }
+                        Some(Ok(frame)) if frame.header.kind == "error" => {
+                            let error = frame.header.error.unwrap_or_else(|| "function worker invocation failed".to_owned());
+                            worker.pending.lock().await.remove(&id);
+                            return Some((Err(std::io::Error::other(error)), (receiver, active)));
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(error)) => {
+                            worker.pending.lock().await.remove(&id);
+                            return Some((Err(std::io::Error::other(error)), (receiver, active)));
+                        }
+                        None => {
+                            worker.pending.lock().await.remove(&id);
+                            return Some((
+                                Err(std::io::Error::other("function worker closed before ending the response")),
+                                (receiver, active),
+                            ));
+                        }
                     }
                 }
             }
@@ -370,15 +378,14 @@ struct FunctionManager {
     entrypoint: PathBuf,
     idle_timeout: Duration,
     worker: Mutex<Option<Arc<Worker>>>,
-    active_requests: AtomicUsize,
+    active_requests: Arc<AtomicUsize>,
 }
 
 impl FunctionManager {
     async fn invoke(&self, request: Request) -> Result<Response> {
-        self.active_requests.fetch_add(1, Ordering::AcqRel);
-        let _active = ActiveRequest { manager: self };
+        let active = ActiveRequest::new(self.active_requests.clone());
         let worker = self.ensure_worker().await?;
-        let response = worker.invoke(request).await;
+        let response = worker.invoke(request, active).await;
         *worker.last_used.lock().await = Instant::now();
         response
     }
@@ -422,12 +429,20 @@ impl FunctionManager {
     }
 }
 
-struct ActiveRequest<'a> {
-    manager: &'a FunctionManager,
+struct ActiveRequest {
+    counter: Arc<AtomicUsize>,
 }
-impl Drop for ActiveRequest<'_> {
+
+impl ActiveRequest {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveRequest {
     fn drop(&mut self) {
-        self.manager.active_requests.fetch_sub(1, Ordering::AcqRel);
+        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -545,7 +560,7 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
             entrypoint,
             idle_timeout: Duration::from_secs(args.idle_timeout_secs),
             worker: Mutex::new(None),
-            active_requests: AtomicUsize::new(0),
+            active_requests: Arc::new(AtomicUsize::new(0)),
         });
         let key = if host == "*" {
             "*".to_owned()
