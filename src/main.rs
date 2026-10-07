@@ -55,9 +55,10 @@ pub struct BuildArgs {
     /// Branch to clone.
     #[arg(long = "git-branch")]
     pub git_branch: String,
-    /// GitHub token used for repository authentication.
-    #[arg(long = "access-token")]
-    pub access_token: String,
+    /// Optional GitHub token for private repository access.
+    /// Prefer MESHSCALE_GITHUB_TOKEN so the credential is not exposed in process arguments.
+    #[arg(long = "access-token", value_name = "TOKEN")]
+    pub access_token: Option<String>,
     /// MeshScale build identifier.
     #[arg(long = "build-id")]
     pub build_id: String,
