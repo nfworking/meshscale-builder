@@ -95,7 +95,7 @@ pub fn create_output(
         "runtime": {
             "type": "node",
             "command": "node",
-            "entrypoint": "runtime/.meshscale-server.cjs",
+            "entrypoint": "runtime/function-entry.cjs",
             "working_directory": "runtime",
             "args": []
         },
