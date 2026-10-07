@@ -94,7 +94,12 @@ impl FunctionManager {
         let mut worker = self.worker.lock().await;
 
         if let Some(existing) = worker.as_mut() {
-            if existing.child.try_wait().context("failed to inspect function worker")?.is_none() {
+            if existing
+                .child
+                .try_wait()
+                .context("failed to inspect function worker")?
+                .is_none()
+            {
                 existing.last_used = Instant::now();
                 return Ok(existing.addr);
             }
@@ -227,7 +232,9 @@ async fn run_async(args: RunArgs) -> Result<()> {
         .with_state(state.clone());
 
     info!(url = %format!("http://127.0.0.1:{}", args.port), "MeshScale local edge ready");
-    info!("Node function workers are lazy: no Node process is started until a dynamic request arrives");
+    info!(
+        "Node function workers are lazy: no Node process is started until a dynamic request arrives"
+    );
 
     axum::serve(
         listener,
@@ -265,7 +272,10 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
                     .split_once('=')
                     .context("--project must use HOST=OUTPUT")?;
                 ensure!(!host.trim().is_empty(), "--project host cannot be empty");
-                ensure!(!output.trim().is_empty(), "--project output cannot be empty");
+                ensure!(
+                    !output.trim().is_empty(),
+                    "--project output cannot be empty"
+                );
                 Ok((host.to_ascii_lowercase(), PathBuf::from(output)))
             })
             .collect::<Result<Vec<_>>>()?
@@ -322,10 +332,7 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
     Ok(projects)
 }
 
-async fn route(
-    State(state): State<AppState>,
-    request: Request,
-) -> Response {
+async fn route(State(state): State<AppState>, request: Request) -> Response {
     let host = request
         .headers()
         .get(header::HOST)
@@ -364,9 +371,8 @@ async fn dispatch(project: Arc<ProjectRuntime>, mut request: Request) -> Respons
         .routing
         .as_ref()
         .context("missing routing contract")
-        .and_then(|routing| {
-            routing.select(request.method(), request.uri(), request.headers())
-        }) {
+        .and_then(|routing| routing.select(request.method(), request.uri(), request.headers()))
+    {
         Ok(value) => value,
         Err(error) => {
             error!(error = %error, "invalid routed request");
@@ -424,7 +430,10 @@ async fn wait_for_worker(child: &mut Child, addr: SocketAddr) -> Result<()> {
             return Ok(());
         }
 
-        if let Some(status) = child.try_wait().context("failed to inspect Node function worker")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect Node function worker")?
+        {
             bail!("Node function worker exited during startup with {status}");
         }
 
