@@ -295,7 +295,6 @@ fn adapter_routing_install_command(
         ],
         PackageManager::Pnpm => vec![
             "add".into(),
-            "--no-save".into(),
             "--lockfile=false".into(),
             "--ignore-scripts".into(),
             spec.into(),
@@ -462,7 +461,6 @@ mod tests {
             pnpm_args,
             vec![
                 "add",
-                "--no-save",
                 "--lockfile=false",
                 "--ignore-scripts",
                 "@next/routing@~16.3.0"
