@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meshscale.dev/schemas/deployment-v2.json",
+  "title": "MeshScale deployment manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "framework", "deployment", "runtime", "static", "server", "routing", "archive", "platform"],
+  "properties": {
+    "version": { "const": 2 },
+    "framework": { "const": "nextjs" },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "repository", "commit", "branch", "org_id", "project_id", "next_build_id", "next_version"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "repository": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "branch": { "type": "string", "minLength": 1 },
+        "org_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "project_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "next_build_id": { "type": "string", "minLength": 1 },
+        "next_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "command", "entrypoint", "working_directory", "args"],
+      "properties": {
+        "type": { "const": "node" },
+        "command": { "const": "node" },
+        "entrypoint": { "const": "runtime/.meshscale-server.cjs" },
+        "working_directory": { "const": "runtime" },
+        "args": { "const": [] }
+      }
+    },
+    "server": {
+      "type": "object", "additionalProperties": false, "required": ["target_id"],
+      "properties": { "target_id": { "type": "string", "minLength": 1 } }
+    },
+    "platform": {
+      "type": "object", "additionalProperties": false,
+      "required": ["os", "arch", "node_version", "node_abi"],
+      "properties": {
+        "os": { "type": "string", "minLength": 1 },
+        "arch": { "type": "string", "minLength": 1 },
+        "node_version": { "type": "string", "minLength": 1 },
+        "node_abi": { "type": "string", "minLength": 1 }
+      }
+    },
+    "archive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["filename", "format", "excludes"],
+      "properties": {
+        "filename": { "type": ["string", "null"], "pattern": "^server_[0-9a-fA-F]{40}_[A-Za-z0-9_-]{1,128}\\.zip$" },
+        "format": { "const": "zip" },
+        "excludes": { "const": ["static/"] }
+      }
+    },
+    "static": {
+      "type": "object", "additionalProperties": false,
+      "required": ["directory", "objects", "storage"],
+      "properties": {
+        "directory": { "const": "static" },
+        "storage": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["provider", "bucket", "prefix"],
+              "properties": {
+                "provider": { "const": "r2" },
+                "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
+                "prefix": { "type": "string", "pattern": "^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/static/$" }
+              }
+            }
+          ]
+        },
+        "objects": {
+          "type": "object",
+          "propertyNames": { "type": "string", "minLength": 1, "pattern": "^[^\\\\:\\u0000]+$" },
+          "additionalProperties": { "$ref": "#/$defs/object" }
+        }
+      }
+    },
+    "routing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantics", "rules", "fallback_reasons"],
+      "properties": {
+        "semantics": { "const": "meshscale-routing-v1" },
+        "fallback_reasons": { "type": "array", "items": { "type": "string" } },
+        "rules": {
+          "type": "array", "minItems": 2,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object", "additionalProperties": false,
+                "required": ["action", "methods_except", "headers_present", "cookies_present", "query_present"],
+                "properties": {
+                  "action": { "const": "server_variants" },
+                  "methods_except": { "const": ["GET", "HEAD"] },
+                  "headers_present": {
+                    "const": ["rsc", "next-action", "next-router-state-tree", "next-router-prefetch", "next-router-segment-prefetch", "x-prerender-revalidate", "x-prerender-revalidate-if-generated", "x-next-revalidated-tags", "x-next-revalidate-tag-token", "x-middleware-prefetch"]
+                  },
+                  "cookies_present": { "const": ["__prerender_bypass", "__next_preview_data"] },
+                  "query_present": { "const": ["_rsc"] }
+                }
+              },
+              {
+                "type": "object", "additionalProperties": false,
+                "required": ["action", "path", "object", "methods", "query"],
+                "properties": {
+                  "action": { "const": "static" },
+                  "path": { "type": "string", "pattern": "^/[^?#\\\\\\u0000]*$" },
+                  "object": { "type": "string", "minLength": 1 },
+                  "methods": { "const": ["GET", "HEAD"] },
+                  "query": { "enum": ["ignore", "empty"] }
+                }
+              },
+              {
+                "type": "object", "additionalProperties": false,
+                "required": ["action"],
+                "properties": { "action": { "const": "server" } }
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+    "object": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "sha256", "content_type", "cache_control", "last_modified", "class", "status", "headers"],
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "content_type": { "type": "string", "minLength": 1 },
+        "cache_control": { "type": "string", "minLength": 1 },
+        "last_modified": { "type": "string", "minLength": 1 },
+        "class": { "enum": ["public_asset", "next_asset", "prerender_html", "prerender_data"] },
+        "status": { "const": 200 },
+        "headers": {
+          "type": "object",
+          "propertyNames": { "enum": ["content-language", "content-disposition", "x-content-type-options"] },
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  }
+}

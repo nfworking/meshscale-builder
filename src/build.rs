@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use git2::{
-    build::RepoBuilder, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository,
+    Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository, build::RepoBuilder,
 };
 use serde_json::Value;
 use std::{
@@ -45,13 +45,19 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
     run_build(&project_dir, package_manager, &package_json)?;
 
     let metadata = BuildMetadata {
-        version: 1,
+        version: 2,
         framework,
         package_manager,
         build_id: args.build_id.clone(),
         repository: format!("{}/{}", args.git_username, args.git_repo),
-        commit: args.git_hash.clone(),
+        commit: Repository::open(&repo_dir)?
+            .head()?
+            .peel_to_commit()?
+            .id()
+            .to_string(),
         branch: args.git_branch.clone(),
+        org_id: args.destination.org_id.clone(),
+        project_id: args.destination.project_id.clone(),
     };
 
     let output_dir = create_output(&project_dir, &metadata, &args.output)?;
@@ -81,7 +87,11 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
     if !args.git_hash.chars().all(|c| c.is_ascii_hexdigit()) || args.git_hash.len() < 7 {
         bail!("--git-hash must look like a Git commit SHA");
     }
-    if !args.git_branch.chars().all(|c| !c.is_control() && c != '\\') {
+    if !args
+        .git_branch
+        .chars()
+        .all(|c| !c.is_control() && c != '\\')
+    {
         bail!("--git-branch contains invalid characters");
     }
 
@@ -93,7 +103,10 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
 }
 
 fn clone_repository(args: &BuildArgs, destination: &Path) -> Result<Repository> {
-    let url = format!("https://github.com/{}/{}.git", args.git_username, args.git_repo);
+    let url = format!(
+        "https://github.com/{}/{}.git",
+        args.git_username, args.git_repo
+    );
     let token = args.access_token.clone();
 
     let mut callbacks = RemoteCallbacks::new();
@@ -230,7 +243,11 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
     run_command(executable, &args, project_dir, "dependency installation")
 }
 
-fn run_build(project_dir: &Path, package_manager: PackageManager, package_json: &Value) -> Result<()> {
+fn run_build(
+    project_dir: &Path,
+    package_manager: PackageManager,
+    package_json: &Value,
+) -> Result<()> {
     let scripts = package_json
         .get("scripts")
         .and_then(Value::as_object)
@@ -252,7 +269,9 @@ fn run_build(project_dir: &Path, package_manager: PackageManager, package_json: 
 }
 
 fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
-    let status = Command::new(executable)
+    let mut command = Command::new(executable);
+    crate::upload::remove_credentials(&mut command);
+    let status = command
         .args(args)
         .current_dir(cwd)
         .env("CI", "true")
@@ -270,9 +289,10 @@ fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> 
     if !status.success() {
         bail!(
             "{operation} failed with exit status {}",
-            status
-                .code()
-                .map_or_else(|| "terminated by signal".to_owned(), |code| code.to_string())
+            status.code().map_or_else(
+                || "terminated by signal".to_owned(),
+                |code| code.to_string()
+            )
         );
     }
 
