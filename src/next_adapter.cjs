@@ -20,6 +20,12 @@ function compactOutput(projectDir, output) {
     pathname: output.pathname,
     runtime: output.runtime || 'nodejs',
     filePath: relativeToProject(projectDir, output.filePath),
+    assets: Object.fromEntries(
+      Object.entries(output.assets || {}).map(([logical, absolute]) => [
+        logical,
+        relativeToProject(projectDir, absolute),
+      ]),
+    ),
   };
 }
 
