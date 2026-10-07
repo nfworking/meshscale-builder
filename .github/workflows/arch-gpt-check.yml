@@ -17,7 +17,7 @@ jobs:
           toolchain: 1.88.0
           components: rustfmt
       - name: Format check
-        run: cargo fmt --all
+        run: cargo fmt --all -- --check
       - name: Compile
         run: cargo check --all-targets
       - name: Tests
