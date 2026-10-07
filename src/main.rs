@@ -1,10 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use indicatif::ProgressBar;
 use serde::Serialize;
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -190,6 +189,12 @@ fn init_terminal_logging() {
 
 fn init_build_logging(output: &Path) -> Result<FileLogGuard> {
     fs::create_dir_all(output)?;
+    let log_path = output.join("build.log");
+    let _ = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&log_path)?;
     let appender = tracing_appender::rolling::never(output, "build.log");
     let (file_writer, guard) = tracing_appender::non_blocking(appender);
 
@@ -326,7 +331,7 @@ fn run_build(args: BuildArgs, env_file: Option<&std::path::Path>) -> Result<()> 
 
             // Make the final record immediately useful when the command is piped,
             // while keeping the normal terminal output human-first.
-            std::io::stdout().flush()?;
+            io::stdout().flush()?;
 
             Ok(())
         }
