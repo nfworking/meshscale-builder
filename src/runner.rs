@@ -242,7 +242,7 @@ async fn run_async(args: RunArgs) -> Result<()> {
             }
         })
         .await
-    .context("local MeshScale edge failed")?;
+        .context("local MeshScale edge failed")?;
 
     Ok(())
 }
