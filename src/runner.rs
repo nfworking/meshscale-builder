@@ -236,12 +236,12 @@ async fn run_async(args: RunArgs) -> Result<()> {
 
     axum::serve(listener, router.into_make_service())
         .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-        for project in state.projects.values() {
-            project.function.shutdown().await;
-        }
-    })
-    .await
+            let _ = tokio::signal::ctrl_c().await;
+            for project in state.projects.values() {
+                project.function.shutdown().await;
+            }
+        })
+        .await
     .context("local MeshScale edge failed")?;
 
     Ok(())
