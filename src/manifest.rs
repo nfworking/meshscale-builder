@@ -138,12 +138,15 @@ fn load_mode(output: &Path, server_only: bool) -> Result<Manifest> {
             .join("bin")
             .join("next")
         && manifest.runtime.args == ["start"];
+    let function_runtime = manifest.runtime.entrypoint
+        == Path::new("runtime").join("function-entry.cjs")
+        && manifest.runtime.args.is_empty();
     let production_server = manifest.runtime.entrypoint
         == Path::new("runtime").join(".meshscale-server.cjs")
         && manifest.runtime.args.is_empty();
     ensure!(
         manifest.runtime.working_directory == Path::new("runtime")
-            && (legacy_cli || production_server)
+            && (legacy_cli || function_runtime || production_server)
             && manifest.r#static.directory == Path::new("static"),
         "unsupported manifest runtime/static layout"
     );
@@ -177,7 +180,18 @@ fn load_mode(output: &Path, server_only: bool) -> Result<Manifest> {
         assets.as_ref().is_none_or(|path| path.is_dir()),
         "manifest static directory is not a directory"
     );
-    if production_server {
+    if function_runtime {
+        let adapter = resolve_path(
+            output,
+            &Path::new("runtime").join(".next").join("meshscale-adapter.json"),
+        )?;
+        let adapter: serde_json::Value = serde_json::from_slice(&fs::read(adapter)?)
+            .context("invalid MeshScale Next.js adapter metadata")?;
+        ensure!(
+            adapter.get("version").and_then(serde_json::Value::as_u64) == Some(1),
+            "unsupported MeshScale adapter metadata version"
+        );
+    } else if production_server {
         let config = resolve_path(
             output,
             &Path::new("runtime")
@@ -218,9 +232,9 @@ impl Manifest {
             "rebuild this legacy artifact for manifest v2 upload/package"
         );
         ensure!(
-            self.runtime.entrypoint == Path::new("runtime").join(".meshscale-server.cjs")
+            self.runtime.entrypoint == Path::new("runtime").join("function-entry.cjs")
                 && self.runtime.args.is_empty(),
-            "v2 requires the production-only server entrypoint"
+            "v2 requires the MeshScale function entrypoint"
         );
         crate::upload::validate_id("build-id", &self.deployment.id)?;
         ensure!(
