@@ -92,3 +92,12 @@ const adapter = {
           parentOutputId: output.parentOutputId,
           route: output.route,
         })),
+      },
+    };
+
+    const metadataPath = path.join(projectDir, '.next', 'meshscale-adapter.json');
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+  },
+};
+
+module.exports = adapter;
