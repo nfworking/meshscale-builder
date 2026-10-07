@@ -157,7 +157,8 @@ fn collect_next_trace_files(
     for entry in WalkDir::new(next_dir).follow_links(false).into_iter() {
         let entry = entry.context("failed to walk Next.js trace directory")?;
         let path = entry.path();
-        if path.strip_prefix(next_dir)
+        if path
+            .strip_prefix(next_dir)
             .ok()
             .and_then(|relative| relative.components().next())
             .is_some_and(|component| component.as_os_str() == "standalone")
