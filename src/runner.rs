@@ -25,8 +25,6 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
     time::sleep,
 };
-use tower::ServiceExt;
-use tower_http::services::ServeFile;
 use tracing::{error, info};
 
 use crate::{artifact, manifest};
@@ -651,10 +649,32 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
                     .strip_prefix(&project.assets_root)
                     .is_ok();
                 if inside && path.is_file() {
-                    match ServeFile::new(path).oneshot(request).await {
-                        Ok(response) => return response.map(Body::new).into_response(),
-                        Err(error) => match error {},
+                    let Some(object) = project.manifest.r#static.objects.get(object_key) else {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    };
+                    let bytes = match tokio::fs::read(&path).await {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        Err(error) => {
+                            error!(error = %error, path = %path.display(), "failed to read static asset");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
+                    let mut response = Response::builder().status(object.status);
+                    response = response
+                        .header(header::CONTENT_TYPE, &object.content_type)
+                        .header(header::CACHE_CONTROL, &object.cache_control)
+                        .header(header::ETAG, object.etag())
+                        .header(header::LAST_MODIFIED, &object.last_modified);
+                    for (name, value) in &object.headers {
+                        response = response.header(name, value);
                     }
+                    if request.method() == Method::HEAD {
+                        return response.body(Body::empty()).unwrap().into_response();
+                    }
+                    return response.body(Body::from(bytes)).unwrap().into_response();
                 }
 
                 error!(
