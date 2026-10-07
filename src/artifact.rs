@@ -92,6 +92,7 @@ pub fn create_output(
 
     copy_runtime_files(&runtime_dir, &all_traced_files)?;
     copy_required_runtime_files(project_dir, &runtime_dir)?;
+    fs::create_dir_all(runtime_dir.join(".next"))?;
     if adapter_metadata.is_file() {
         let destination = runtime_dir.join(".next").join("meshscale-adapter.json");
         fs::create_dir_all(
