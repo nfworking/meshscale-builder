@@ -39,14 +39,14 @@ The builder does **not** modify next.config.* and does **not** force output: "st
         ├── .next/
         ├── node_modules/
         ├── package.json
-        └── .meshscale-server.cjs
+        └── function-entry.cjs
 ~~~
 
 New artifacts contain a production-only Node entrypoint:
 
 ~~~text
 cd .meshscale/output/runtime
-node .meshscale-server.cjs
+node function-entry.cjs
 ~~~
 
 It starts Next.js using the configuration captured in `.next/required-server-files.json`, rather than re-evaluating the source `next.config.*`. The builder neither edits the source configuration nor requires `output: "standalone"`.
@@ -268,3 +268,26 @@ The artifact validation rejects symbolic links and Windows junction/reparse-poin
 The GitHub access token is currently supplied through --access-token because this is still an internal prototype interface. It should eventually be injected through a safer secret mechanism so it is not exposed in process arguments.
 
 Build execution is not sandboxed yet. Only run builds from repositories that MeshScale is prepared to execute with the privileges of the builder host.
+
+
+## Local edge runner
+
+The builder includes a local execution node for testing the deployment model:
+
+```bash
+meshscale-builder run .meshscale/output
+```
+
+The runner owns HTTP routing and static delivery. Dynamic requests are dispatched to a lazy Node function worker that invokes the Next.js Adapter entrypoints directly. The worker is kept warm for concurrent requests and is stopped after the idle timeout.
+
+Multiple deployments can be tested through one local edge process:
+
+```bash
+meshscale-builder run \
+  --project app.localhost=./app-output \
+  --project blog.localhost=./blog-output
+```
+
+The runner starts with no Node workers. A dynamic request starts only the function belonging to that project. Static requests never start Node.
+
+Next.js builds are connected to MeshScale through `NEXT_ADAPTER_PATH`; the builder does not modify the application's `next.config`. The adapter records deployment outputs and routing information, while Node entrypoints use the public `handler(req, res, ctx)` contract.
