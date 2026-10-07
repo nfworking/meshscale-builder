@@ -241,7 +241,7 @@ pub fn response(
                 if start.is_empty() {
                     let suffix: u64 = end.parse().ok()?;
                     (suffix > 0 && length > 0)
-                        .then_some((length.saturating_sub(suffix), length - 1))
+                        .then(|| (length.saturating_sub(suffix), length - 1))
                 } else {
                     let start: u64 = start.parse().ok()?;
                     let end = if end.is_empty() {
@@ -395,6 +395,9 @@ mod tests {
         headers.clear();
         headers.insert(header::RANGE, "bytes=0-1,4-5".parse()?);
         assert!(response(bytes, &Method::GET, &headers, &object)?.is_none());
+        headers.insert(header::RANGE, "bytes=-1".parse()?);
+        assert_eq!(response(Bytes::new(), &Method::GET, &headers, &object)?.unwrap().status(),
+            StatusCode::RANGE_NOT_SATISFIABLE);
         Ok(())
     }
 }

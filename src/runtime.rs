@@ -375,6 +375,9 @@ async fn route(
                             if !allowed {
                                 request.headers_mut().remove(header::RANGE);
                             }
+                            if request.method() == Method::HEAD {
+                                request.headers_mut().remove(header::RANGE);
+                            }
                         }
                     }
                     match ServeFile::new(path).oneshot(request).await {

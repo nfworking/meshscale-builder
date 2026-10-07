@@ -125,7 +125,8 @@ impl Routing {
                 anyhow::bail!("only exact static rules are supported between bypass and fallback");
             };
             ensure!(
-                path.starts_with('/') && !path.contains(['?', '#', '\\', '\0']),
+                path.starts_with('/') && !path.contains([':', '\\', '\0'])
+                    && path.split('/').all(|part| part != "." && part != ".."),
                 "invalid static URL path"
             );
             ensure!(paths.insert(path), "duplicate static URL");

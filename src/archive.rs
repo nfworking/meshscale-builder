@@ -52,6 +52,7 @@ pub fn package(args: PackageArgs) -> Result<()> {
     let staging = tempfile::TempDir::new()?;
     snapshot(&args.output, staging.path())?;
     manifest::write(staging.path(), &metadata)?;
+    static_output::verify_inventory(staging.path(), &metadata)?;
     let destination = destination(&args.output, &metadata)?;
     let result = create(staging.path(), &destination)?;
     println!(

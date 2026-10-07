@@ -157,6 +157,8 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
             .get("experimental")
             .and_then(|v| v.get("ppr"))
             .is_some_and(|v| v != &Value::Bool(false))
+        || config["cacheComponents"] == true
+        || config["experimental"]["dynamicIO"] == true
     {
         reasons.push("middleware-proxy-or-partial-prerendering".to_owned());
     }
@@ -182,6 +184,9 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
         base.is_empty() || (base.starts_with('/') && !base.ends_with('/')),
         "invalid Next basePath"
     );
+    if config["assetPrefix"].as_str().is_some_and(|prefix| !prefix.is_empty() && prefix != base) {
+        reasons.push("custom-asset-prefix".to_owned());
+    }
     let static_dir = output.join("static");
     for entry in WalkDir::new(&static_dir).follow_links(false) {
         let entry = entry?;
@@ -318,11 +323,15 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
             .get("initialHeaders")
             .and_then(Value::as_object)
             .is_some_and(|headers| {
-                headers.keys().any(|key| {
-                    !matches!(
-                        key.to_ascii_lowercase().as_str(),
-                        "content-type" | "cache-control" | "x-next-cache-tags"
-                    )
+                headers.iter().any(|(key, value)| {
+                    match key.to_ascii_lowercase().as_str() {
+                        "x-next-cache-tags" => false,
+                        "content-type" => value.as_str().is_none_or(|value| !value.to_ascii_lowercase().starts_with("text/html")),
+                        "cache-control" => value.as_str().is_none_or(|value| value.to_ascii_lowercase().split(',').any(|directive| {
+                            matches!(directive.trim().split('=').next().unwrap_or(""), "private" | "no-store" | "no-cache")
+                        })),
+                        _ => true,
+                    }
                 })
             })
         {

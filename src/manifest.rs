@@ -221,13 +221,13 @@ impl Manifest {
             }
         }
         ensure!(
+            self.version == 2,
+            "rebuild this legacy artifact for manifest v2 upload/package"
+        );
+        ensure!(
             self.runtime.entrypoint == Path::new("runtime").join(".meshscale-server.cjs")
                 && self.runtime.args.is_empty(),
             "v2 requires the production-only server entrypoint"
-        );
-        ensure!(
-            self.version == 2,
-            "rebuild this legacy artifact for manifest v2 upload/package"
         );
         crate::upload::validate_id("build-id", &self.deployment.id)?;
         ensure!(
@@ -304,6 +304,7 @@ impl Manifest {
                 &object.cache_control,
                 &object.last_modified,
             ] {
+                ensure!(!value.is_empty(), "empty static response metadata");
                 axum::http::HeaderValue::from_str(value)
                     .context("invalid static response metadata")?;
             }

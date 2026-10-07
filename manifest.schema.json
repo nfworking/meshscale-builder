@@ -111,7 +111,7 @@
                 "required": ["action", "path", "object", "methods", "query"],
                 "properties": {
                   "action": { "const": "static" },
-                  "path": { "type": "string", "pattern": "^/[^?#\\\\\\u0000]*$" },
+                  "path": { "type": "string", "pattern": "^/[^:\\\\\\u0000]*$" },
                   "object": { "type": "string", "minLength": 1 },
                   "methods": { "const": ["GET", "HEAD"] },
                   "query": { "enum": ["ignore", "empty"] }

@@ -286,7 +286,7 @@ async fn upload_async(
     let (org, project) = destination.validate()?;
     artifact::validate_output(output)?;
     manifest::load(output)?.validate_v2()?;
-    let staging = tempfile::TempDir::new().context("failed to create upload snapshot")?;
+    let staging = std::sync::Arc::new(tempfile::TempDir::new().context("failed to create upload snapshot")?);
     let files = snapshot(output, staging.path())?;
     // Validate the snapshot, not just the live directory, before publishing anything.
     artifact::validate_output(staging.path())?;
@@ -372,9 +372,9 @@ async fn upload_async(
             report_progress(completed_bytes, total_bytes, completed_files, total_files);
         }
         eprintln!("Static transfer complete; packaging local server ZIP");
-        let source = staging.path().to_path_buf();
+        let source = staging.clone();
         let archive_result = tokio::task::spawn_blocking(move || {
-            crate::archive::create(&source, &archive_destination)
+            crate::archive::create(source.path(), &archive_destination)
         })
         .await
         .context("server archive task failed")??;
