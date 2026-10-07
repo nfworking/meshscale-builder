@@ -97,6 +97,24 @@ const adapter = {
 
     const metadataPath = path.join(projectDir, '.next', 'meshscale-adapter.json');
     fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+
+    // Next.js 16.3 Turbopack intentionally omits the root server NFT files
+    // when an adapter is configured. Its standalone finalization path still
+    // reads those files when output: "standalone" is enabled, however. MeshScale
+    // does not consume Next's standalone directory, so provide empty trace
+    // manifests solely to keep that finalization path compatible.
+    for (const traceName of [
+      'next-server.js.nft.json',
+      'next-minimal-server.js.nft.json',
+    ]) {
+      const tracePath = path.join(projectDir, '.next', traceName);
+      if (!fs.existsSync(tracePath)) {
+        fs.writeFileSync(tracePath, JSON.stringify({
+          version: 1,
+          files: [],
+        }));
+      }
+    }
   },
 };
 
