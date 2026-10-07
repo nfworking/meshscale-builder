@@ -234,15 +234,15 @@ This version uses single-object PUTs, rejects static objects larger than 5 GiB b
 The opt-in integration tests install/build real npm and pnpm Next.js applications, delete their source checkouts, check dynamic HTML, manifest-served generated HTML, saved configuration, a POST API and public assets, then publish to mock S3 and check that no runtime objects are sent and the manifest is published last:
 
 ~~~text
-cargo test runtime::tests::runs_relocated_nextjs_application -- --ignored --nocapture
-cargo test runtime::tests::runs_relocated_pnpm_nextjs_application -- --ignored --nocapture
+cargo test --all-targets
+cargo run -- run .meshscale/output
 ~~~
 
 These require npm, Node and network access. The pnpm test obtains pnpm 10 through `npm exec` and exercises an isolated pnpm dependency layout.
 
 ## Next.js tracing
 
-Next.js itself uses @vercel/nft during production builds and emits `.nft.json` manifests, including `.next/next-server.js.nft.json` for the production server. The builder consumes those manifests directly. If the project enables Next's `output: "standalone"`, the generated `.next/standalone` tree is intentionally ignored: it has its own copied `.nft.json` files whose paths are relative to the standalone staging tree, not the original project root. MeshScale builds its own relocatable runtime from the source project's tracing manifests instead.
+Next.js itself uses @vercel/nft during production builds. MeshScale now traces the generated Adapter function entrypoint and its dependencies rather than tracing a `next start` server. The Next.js Adapter metadata is the deployment-level source of truth for outputs and routing. If the project enables Next's `output: "standalone"`, the generated `.next/standalone` tree is intentionally ignored: it has its own copied `.nft.json` files whose paths are relative to the standalone staging tree, not the original project root. MeshScale builds its own relocatable runtime from the source project's tracing manifests instead.
 
 Next.js's application/server manifests are the primary source of runtime dependencies. They do not necessarily include everything needed to launch the server (for example, the `next start` CLI or programmatic startup modules). The builder additionally traces its generated production entrypoint using the NFT implementation bundled with the installed Next.js package (`next/dist/compiled/@vercel/nft`); customers do not need to declare a separate NFT dependency. Tracing errors fail the build and NFT warnings are logged.
 
