@@ -181,33 +181,18 @@ fn resolve_project_dir(repo_dir: &Path, dir: &str) -> Result<PathBuf> {
         bail!("--dir is not a directory: {}", canonical_project.display());
     }
 
-    // Node.js on Windows currently mishandles extended-length (\\\\?\\) paths
-    // when resolving the entry script. Rust's canonicalize() returns that form,
-    // so strip the verbatim prefix before handing the project path to npm/Next.
-    // Keep the canonical path for the containment check above; only the path
-    // returned to Node-facing build commands is normalized.
-    #[cfg(windows)]
-    {
-        let normalized = normalize_windows_node_path(&canonical_project);
-        return Ok(normalized);
-    }
-
-    #[cfg(not(windows))]
-    Ok(canonical_project)
+    // canonicalize() may produce an extended-length Windows path (\\?\\C:\\...).
+    // Node.js/Next.js can mis-handle that form and report EISDIR on the drive
+    // component ("lstat 'C:'"). We only need the canonical path for the
+    // containment/security check above. Return the original joined path to
+    // Node-facing commands so Rust does not re-emit the verbatim prefix when
+    // constructing the adapter path or changing the working directory.
+    //
+    // The containment check above is still performed against canonical paths,
+    // and project_dir was constructed directly under repo_dir with '..' already
+    // rejected, so returning it does not weaken the security boundary.
+    Ok(project_dir)
 }
-
-#[cfg(windows)]
-fn normalize_windows_node_path(path: &Path) -> PathBuf {
-    let value = path.to_string_lossy();
-    if let Some(rest) = value.strip_prefix(r"\\?\\UNC\\") {
-        PathBuf::from(format!(r"\\\\{rest}"))
-    } else if let Some(rest) = value.strip_prefix(r"\\?\\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 fn load_package_json(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("package.json not found at {}", path.display()))?;
