@@ -75,6 +75,9 @@ pub fn create_output(
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
     if metadata.version == 2 {
+        collect_adapter_assets(project_dir, &project_root, &adapter_metadata, &mut all_traced_files)?;
+    }
+    if metadata.version == 2 {
         ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
         ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
     }
@@ -315,6 +318,52 @@ fn collect_trace_entry(
         }
     }
 
+    Ok(())
+}
+
+fn collect_adapter_assets(
+    project_dir: &Path,
+    project_root: &Path,
+    metadata_path: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Adapter {
+        outputs: serde_json::Value,
+    }
+
+    let metadata: Adapter = serde_json::from_slice(&fs::read(metadata_path)?)
+        .context("invalid MeshScale adapter metadata")?;
+    let groups = ["pages", "pagesApi", "appPages", "appRoutes", "staticFiles"];
+    for group in groups {
+        let Some(outputs) = metadata.outputs.get(group).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for output in outputs {
+            let Some(assets) = output.get("assets").and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for (logical, relative) in assets {
+                let relative = relative
+                    .as_str()
+                    .context("adapter asset path is not a string")?;
+                let source = project_dir.join(relative).canonicalize().with_context(|| {
+                    format!("adapter asset does not exist: {relative}")
+                })?;
+                let logical = Path::new(logical);
+                ensure!(
+                    logical.is_relative()
+                        && logical.components().all(|component| {
+                            matches!(component, std::path::Component::Normal(_))
+                        }),
+                    "invalid adapter asset path: {}",
+                    logical.display()
+                );
+                let logical = logical.to_string_lossy().replace('\\', "/");
+                collect_trace_entry(files, project_root, &logical, &source)?;
+            }
+        }
+    }
     Ok(())
 }
 
