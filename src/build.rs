@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::artifact::create_output;
 use crate::{BuildArgs, BuildMetadata, Framework, PackageManager};
 
-pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
+pub fn build_application(\n    args: &BuildArgs,\n    progress: &crate::cli::BuildProgress,\n) -> Result<(BuildMetadata, PathBuf)> {
     validate_args(args)?;
 
     let workspace = TempDir::new().context("failed to create temporary build workspace")?;
@@ -61,7 +61,7 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
         project_id: args.destination.project_id.clone(),
     };
 
-    let output_dir = create_output(&project_dir, &metadata, &args.output)?;
+    let output_dir = progress.step("Packaging deployment artifact", || {\n        create_output(&project_dir, &metadata, &args.output)\n    })?;
     Ok((metadata, output_dir))
 }
 
