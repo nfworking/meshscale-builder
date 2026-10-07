@@ -9,7 +9,7 @@ mod build;
 mod cache;
 mod manifest;
 mod routing;
-mod runtime;
+mod runner;
 mod static_output;
 mod stats;
 mod upload;
@@ -33,7 +33,7 @@ enum Commands {
     /// Build a deployment artifact and upload it to R2 unless --no-upload is set.
     Build(BuildArgs),
     /// Serve static assets and proxy dynamic requests to a managed Node runtime.
-    Run(runtime::RunArgs),
+    Run(runner::RunArgs),
     /// Upload a previously built output to an immutable R2 deployment prefix.
     Upload(upload::UploadArgs),
 }
@@ -190,7 +190,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Build(args) => run_build(args, cli.env_file.as_deref()),
-        Commands::Run(args) => runtime::run(args),
+        Commands::Run(args) => runner::run(args),
         Commands::Upload(args) => upload::upload(args, cli.env_file.as_deref()),
     };
 
@@ -337,12 +337,21 @@ mod tests {
             ),
         ] {
             let mut args = vec!["meshscale-builder", "run", ".meshscale/output"];
-            args.extend(extra);
-            let cli = Cli::try_parse_from(args).unwrap();
-            let Commands::Run(args) = cli.command else {
-                panic!("expected run command");
-            };
-            assert_eq!((args.port, args.runtime_port), expected);
+            if extra.is_empty() {
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Commands::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert_eq!(args.port, expected.0);
+                assert!(args.projects.is_empty());
+            } else {
+                args.extend(["--port", "8080"]);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Commands::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert_eq!(args.port, expected.0);
+            }
         }
         assert!(
             Cli::try_parse_from([
