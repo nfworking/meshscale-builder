@@ -66,7 +66,7 @@ impl FunctionManager {
         let uri = format!(
             "http://{}{}",
             addr,
-            request.uri().path_and_query().map_or("/", Uri::as_str)
+            request.uri().path_and_query().map_or("/", |value| value.as_str())
         )
         .parse::<Uri>()
         .context("failed to construct function invocation URI")?;
@@ -352,7 +352,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     dispatch(project, request).await
 }
 
-async fn dispatch(project: Arc<ProjectRuntime>, mut request: Request) -> Response {
+async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
     if request.headers().contains_key(header::UPGRADE) {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -376,7 +376,7 @@ async fn dispatch(project: Arc<ProjectRuntime>, mut request: Request) -> Respons
     };
 
     if let Some(object_key) = selected {
-        let Some(object) = project.manifest.r#static.objects.get(object_key) else {
+        let Some(_object) = project.manifest.r#static.objects.get(object_key) else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         let candidate = project.assets.join(object_key);
@@ -439,7 +439,6 @@ async fn wait_for_worker(child: &mut Child, addr: SocketAddr) -> Result<()> {
 fn strip_hop_headers(headers: &mut axum::http::HeaderMap) {
     for name in [
         header::CONNECTION,
-        header::KEEP_ALIVE,
         header::PROXY_AUTHENTICATE,
         header::PROXY_AUTHORIZATION,
         header::TE,
