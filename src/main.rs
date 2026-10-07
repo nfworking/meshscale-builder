@@ -155,7 +155,7 @@ impl BuildMetadata {
     }
 }
 
-struct FileLogGuard(tracing_appender::non_blocking::WorkerGuard);
+struct FileLogGuard {\n    _guard: tracing_appender::non_blocking::WorkerGuard,\n}
 
 fn main() {
     let cli = Cli::parse();
@@ -221,7 +221,7 @@ fn init_build_logging(output: &Path) -> Result<FileLogGuard> {
         .with(env_filter)
         .try_init()?;
 
-    Ok(FileLogGuard(guard))
+    Ok(FileLogGuard { _guard: guard })
 }
 
 fn run_build(args: BuildArgs, env_file: Option<&std::path::Path>) -> Result<()> {
