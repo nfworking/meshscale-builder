@@ -797,7 +797,7 @@ pub(crate) mod tests {
                 .join("package.json"),
             "{}",
         )?;
-        fs::write(runtime.join(".meshscale-server.cjs"), "// test")?;
+        fs::write(runtime.join("function-entry.cjs"), "// test")?;
         fs::write(
             runtime.join(".next").join("required-server-files.json"),
             r#"{"config":{}}"#,
@@ -811,7 +811,7 @@ pub(crate) mod tests {
         fs::write(output.path().join("manifest.json"), serde_json::json!({
                     "version": 1, "framework": "nextjs",
                     "runtime": {"type":"node", "command":"node",
-                        "entrypoint":"runtime/.meshscale-server.cjs", "working_directory":"runtime", "args":[]},
+                        "entrypoint":"runtime/function-entry.cjs", "working_directory":"runtime", "args":[]},
                     "static": {"directory":"static"},
                     "deployment": {"id":"build_789", "repository":"test/repo", "commit":"test", "branch":"main",
                         "org_id":"org_123", "project_id":"project_456"}
