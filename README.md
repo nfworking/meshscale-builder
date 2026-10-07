@@ -56,7 +56,6 @@ cargo run -- build \
   --git-repo example \
   --git-hash 0123456789abcdef0123456789abcdef01234567 \
   --git-branch main \
-  --access-token "$GITHUB_TOKEN" \
   --build-id build_123 \
   --org-id org_123 \
   --project-id project_456
@@ -71,7 +70,6 @@ cargo run -- build \
   --git-repo example \
   --git-hash 0123456789abcdef0123456789abcdef01234567 \
   --git-branch main \
-  --access-token "$GITHUB_TOKEN" \
   --build-id build_123 \
   --org-id org_123 \
   --project-id project_456
@@ -80,6 +78,19 @@ cargo run -- build \
 The output defaults to .meshscale/output and can be changed with --output.
 
 Build uploads by default and requires organization/project IDs and R2 configuration. It checks those settings before cloning/installing. For credential-free local build/run testing, append `--no-upload`; organization/project IDs are optional in that mode (but must be supplied together). Build records supplied IDs in `manifest.json`.
+
+### GitHub repository access
+
+GitHub authentication is optional. Public repositories are cloned anonymously. Private repositories require a token with read access to the repository; if an unauthenticated clone is rejected by GitHub, the builder reports that authentication is required instead of silently treating the repository as missing.
+
+For local development, the token can be supplied with `--access-token`. For production, prefer the process environment so the token is not exposed in command-line arguments:
+
+~~~powershell
+$env:MESHSCALE_GITHUB_TOKEN = "github_pat_..."
+.\\meshscale-builder.exe build --git-username nfworking --git-repo example --git-hash 0123456789abcdef0123456789abcdef01234567 --git-branch main --build-id build_123 --no-upload
+~~~
+
+If both are supplied, `--access-token` takes precedence. The builder never logs the token and strips `MESHSCALE_GITHUB_TOKEN` before launching package-manager/build child processes. In MeshScale production, use a short-lived GitHub App installation token injected by the control plane rather than a long-lived personal token. GitHub recommends GitHub Apps for acting on behalf of an organization or another user and recommends least-privilege, expiring credentials. Fine-grained tokens used for repository access should be limited to the required repository and read-only contents access.
 
 Build success JSON includes an `upload` object with bucket, prefix, manifest key, and uploaded file count/bytes; it is `null` when upload is disabled. If upload fails after a successful build, the command fails but preserves the local artifact and reports its output path. `build_time_ms` includes upload time when enabled. Logs and progress go to stderr; result JSON goes to stdout.
 
@@ -243,7 +254,7 @@ The artifact validation rejects symbolic links and Windows junction/reparse-poin
 
 ## Security
 
-The GitHub access token is currently supplied through --access-token because this is still an internal prototype interface. It should eventually be injected through a safer secret mechanism so it is not exposed in process arguments.
+GitHub repository authentication is optional for public repositories. For private repositories, supply `MESHSCALE_GITHUB_TOKEN` through the builder process environment or use `--access-token` for local development. The production control plane should inject a short-lived GitHub App installation token rather than persist a long-lived personal token. The token is never logged and is removed from child-process environments.
 
 Build execution is not sandboxed yet. Only run builds from repositories that MeshScale is prepared to execute with the privileges of the builder host.
 
