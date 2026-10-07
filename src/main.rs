@@ -328,31 +328,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_defaults_and_custom_ports() {
-        for (extra, expected) in [
-            (vec![], (3000, 3100)),
-            (
-                vec!["--port", "8080", "--runtime-port", "8100"],
-                (8080, 8100),
-            ),
-        ] {
-            let mut args = vec!["meshscale-builder", "run", ".meshscale/output"];
-            if extra.is_empty() {
-                let cli = Cli::try_parse_from(args).unwrap();
-                let Commands::Run(args) = cli.command else {
-                    panic!("expected run command");
-                };
-                assert_eq!(args.port, expected.0);
-                assert!(args.projects.is_empty());
-            } else {
-                args.extend(["--port", "8080"]);
-                let cli = Cli::try_parse_from(args).unwrap();
-                let Commands::Run(args) = cli.command else {
-                    panic!("expected run command");
-                };
-                assert_eq!(args.port, expected.0);
-            }
-        }
+    fn parses_run_defaults_and_projects() {
+        let cli = Cli::try_parse_from([
+            "meshscale-builder",
+            "run",
+            ".meshscale/output",
+            "--port",
+            "8080",
+        ])
+        .unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.output, Some(PathBuf::from(".meshscale/output")));
+        assert_eq!(args.port, 8080);
+        assert!(args.projects.is_empty());
+
+        let cli = Cli::try_parse_from([
+            "meshscale-builder",
+            "run",
+            "--project",
+            "app.localhost=./app-output",
+            "--project",
+            "blog.localhost=./blog-output",
+        ])
+        .unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.output.is_none());
+        assert_eq!(args.projects.len(), 2);
+
         assert!(
             Cli::try_parse_from([
                 "meshscale-builder",
