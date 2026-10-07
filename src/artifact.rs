@@ -74,6 +74,8 @@ pub fn create_output(
         bail!("project trace conflicts with the generated function-entry.cjs entrypoint");
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
+    ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
+    ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
     materialize_package_dependencies(&project_root, &mut all_traced_files)?;
 
     info!(files = all_traced_files.len(), "collected runtime trace");
@@ -312,6 +314,20 @@ fn collect_trace_entry(
     }
 
     Ok(())
+}
+
+fn ensure_runtime_package_manifest(
+    project_root: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+    package_name: &str,
+) -> Result<()> {
+    let source = project_root.join("node_modules").join(package_name).join("package.json");
+    let source = source.canonicalize().with_context(|| {
+        format!("required runtime package is missing: {package_name}")
+    })?;
+    let logical = Path::new("node_modules").join(package_name).join("package.json");
+    let logical = logical.to_string_lossy().replace('\\', "/");
+    collect_trace_entry(files, project_root, &logical, &source)
 }
 
 fn materialize_package_dependencies(
