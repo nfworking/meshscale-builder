@@ -42,7 +42,7 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
     );
 
     install_dependencies(&project_dir, package_manager)?;
-    install_adapter_runtime_dependency(&project_dir)?;
+    install_adapter_runtime_dependency(&project_dir, package_manager)?;
     run_build(&project_dir, package_manager, &package_json)?;
 
     let metadata = BuildMetadata {
@@ -244,7 +244,10 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
     run_command(executable, &args, project_dir, "dependency installation")
 }
 
-fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
+fn install_adapter_runtime_dependency(
+    project_dir: &Path,
+    package_manager: PackageManager,
+) -> Result<()> {
     let next_package = project_dir
         .join("node_modules")
         .join("next")
@@ -261,23 +264,49 @@ fn install_adapter_runtime_dependency(project_dir: &Path) -> Result<()> {
 
     // @next/routing is released independently from Next.js, so an exact
     // @next/routing@<next-version> install can fail even when that Next.js
-    // version is valid. Keep routing on the same stable major/minor line and
-    // let npm select the latest published patch in that line.
+    // version is valid. Keep routing on the same stable major/minor line.
     let spec = adapter_routing_spec(version)?;
-    let args = [
-        "install",
-        "--no-save",
-        "--package-lock=false",
-        "--ignore-scripts",
-        spec.as_str(),
-    ];
+    let (executable, args) = adapter_routing_install_command(package_manager, &spec);
     info!(
         next_version = version,
         routing_spec = %spec,
-        command = %format_command("npm", &args),
+        package_manager = package_manager.as_str(),
+        command = %format_command(executable, &args),
         "installing Next.js adapter routing runtime"
     );
-    run_command("npm", &args, project_dir, "adapter routing installation")
+    run_command(executable, &args, project_dir, "adapter routing installation")
+}
+
+fn adapter_routing_install_command(
+    package_manager: PackageManager,
+    spec: &str,
+) -> (&'static str, Vec<String>) {
+    let executable = package_manager.executable();
+    let args = match package_manager {
+        // The build workspace is disposable, so there is no reason to write
+        // a package lock or persist the temporary adapter dependency.
+        PackageManager::Npm => vec![
+            "install".into(),
+            "--no-save".into(),
+            "--package-lock=false".into(),
+            "--ignore-scripts".into(),
+            spec.into(),
+        ],
+        PackageManager::Pnpm => vec![
+            "add".into(),
+            "--no-save".into(),
+            "--lockfile=false".into(),
+            "--ignore-scripts".into(),
+            spec.into(),
+        ],
+        PackageManager::Yarn => vec![
+            "add".into(),
+            "--ignore-scripts".into(),
+            "--mode=skip-builds".into(),
+            spec.into(),
+        ],
+    };
+    (executable, args)
 }
 
 fn adapter_routing_spec(next_version: &str) -> Result<String> {
@@ -406,7 +435,52 @@ fn format_command(executable: &str, args: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::adapter_routing_spec;
+    use super::{adapter_routing_install_command, adapter_routing_spec};
+
+    
+    #[test]
+    fn adapter_routing_uses_detected_package_manager() {
+        let (npm, npm_args) =
+            adapter_routing_install_command(super::PackageManager::Npm, "@next/routing@~16.3.0");
+        assert_eq!(npm, "npm");
+        assert_eq!(
+            npm_args,
+            vec![
+                "install",
+                "--no-save",
+                "--package-lock=false",
+                "--ignore-scripts",
+                "@next/routing@~16.3.0"
+            ]
+        );
+
+        let (pnpm, pnpm_args) =
+            adapter_routing_install_command(super::PackageManager::Pnpm, "@next/routing@~16.3.0");
+        assert_eq!(pnpm, "pnpm");
+        assert_eq!(
+            pnpm_args,
+            vec![
+                "add",
+                "--no-save",
+                "--lockfile=false",
+                "--ignore-scripts",
+                "@next/routing@~16.3.0"
+            ]
+        );
+
+        let (yarn, yarn_args) =
+            adapter_routing_install_command(super::PackageManager::Yarn, "@next/routing@~16.3.0");
+        assert_eq!(yarn, "yarn");
+        assert_eq!(
+            yarn_args,
+            vec![
+                "add",
+                "--ignore-scripts",
+                "--mode=skip-builds",
+                "@next/routing@~16.3.0"
+            ]
+        );
+    }
 
     #[test]
     fn adapter_routing_uses_same_major_minor_line() {
