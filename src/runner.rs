@@ -227,20 +227,15 @@ async fn run_async(args: RunArgs) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind local edge port {}", args.port))?;
 
-    let router = Router::new()
-        .fallback(route)
-        .with_state(state.clone());
+    let router = Router::new().fallback(route).with_state(state.clone());
 
     info!(url = %format!("http://127.0.0.1:{}", args.port), "MeshScale local edge ready");
     info!(
         "Node function workers are lazy: no Node process is started until a dynamic request arrives"
     );
 
-    axum::serve(
-        listener,
-        router.into_make_service(),
-    )
-    .with_graceful_shutdown(async {
+    axum::serve(listener, router.into_make_service())
+        .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
         for project in state.projects.values() {
             project.function.shutdown().await;
