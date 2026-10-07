@@ -29,7 +29,7 @@
       "properties": {
         "type": { "const": "node" },
         "command": { "const": "node" },
-        "entrypoint": { "const": "runtime/.meshscale-server.cjs" },
+        "entrypoint": { "const": "runtime/function-entry.cjs" },
         "working_directory": { "const": "runtime" },
         "args": { "const": [] }
       }
