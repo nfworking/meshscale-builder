@@ -74,8 +74,10 @@ pub fn create_output(
         bail!("project trace conflicts with the generated function-entry.cjs entrypoint");
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
-    ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
-    ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
+    if metadata.version == 2 {
+        ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
+        ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
+    }
     materialize_package_dependencies(&project_root, &mut all_traced_files)?;
 
     info!(files = all_traced_files.len(), "collected runtime trace");
