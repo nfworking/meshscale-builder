@@ -455,6 +455,9 @@ struct ProjectRuntime {
     host: String,
     output: PathBuf,
     assets: PathBuf,
+    /// Canonical static root used only for traversal/symlink containment checks.
+    /// On Windows this may be a `\\?\\` path; it must not be passed to Node.
+    assets_root: PathBuf,
     manifest: Arc<manifest::Manifest>,
     function: Arc<FunctionManager>,
 }
@@ -554,6 +557,8 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
         let cwd = manifest::resolve_path(&output, &manifest.runtime.working_directory)?;
         let entrypoint = manifest::resolve_path(&output, &manifest.runtime.entrypoint)?;
         let assets = manifest::resolve_path(&output, &manifest.r#static.directory)?;
+        let assets_root = std::fs::canonicalize(&assets)
+            .with_context(|| format!("failed to resolve static directory: {}", assets.display()))?;
         ensure!(
             manifest.runtime.entrypoint == PathBuf::from("runtime/function-entry.cjs"),
             "runner requires a MeshScale function artifact"
@@ -581,6 +586,7 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
                 host: key,
                 output,
                 assets,
+                assets_root,
                 manifest,
                 function,
             }),
@@ -640,7 +646,7 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
         };
         let candidate = project.assets.join(object_key);
         match tokio::fs::canonicalize(&candidate).await {
-            Ok(path) if path.starts_with(&project.assets) && path.is_file() => {
+            Ok(path) if path.starts_with(&project.assets_root) && path.is_file() => {
                 match ServeFile::new(path).oneshot(request).await {
                     Ok(response) => return response.map(Body::new).into_response(),
                     Err(error) => match error {},
