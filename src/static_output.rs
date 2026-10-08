@@ -502,7 +502,7 @@ mod tests {
         )?;
         let metadata = serde_json::from_value(serde_json::json!({
             "version":2,"framework":"nextjs",
-            "runtime":{"type":"node","command":"node","entrypoint":"runtime/.meshscale-server.cjs","working_directory":"runtime","args":[]},
+            "runtime":{"type":"node","command":"node","entrypoint":"runtime/function-entry.cjs","working_directory":"runtime","args":[]},
             "static":{"directory":"static"},
             "deployment":{"id":"build_1","repository":"test/repo","commit":"1234567890abcdef1234567890abcdef12345678","branch":"main"}
         }))?;

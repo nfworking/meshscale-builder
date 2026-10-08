@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -25,11 +25,11 @@ pub fn create_output(
         );
     }
 
-    let next_server_trace = next_dir.join("next-server.js.nft.json");
-    if !next_server_trace.is_file() {
+    let adapter_metadata = next_dir.join("meshscale-adapter.json");
+    if metadata.version == 2 && !adapter_metadata.is_file() {
         bail!(
-            "Next.js production server trace was not produced: {}",
-            next_server_trace.display()
+            "MeshScale Next.js adapter did not produce deployment metadata: {}",
+            adapter_metadata.display()
         );
     }
 
@@ -56,11 +56,7 @@ pub fn create_output(
             .join(output_dir)
     };
 
-    if output_dir.exists() {
-        fs::remove_dir_all(&output_dir).with_context(|| {
-            format!("failed to remove previous output {}", output_dir.display())
-        })?;
-    }
+    prepare_output_dir(&output_dir)?;
 
     let runtime_dir = output_dir.join("runtime");
     let static_dir = output_dir.join("static");
@@ -70,24 +66,46 @@ pub fn create_output(
         .with_context(|| format!("failed to create {}", static_dir.display()))?;
 
     let mut all_traced_files = collect_next_trace_files(&next_dir, &project_root)?;
-    if all_traced_files.contains_key(".meshscale-server.cjs") {
-        bail!("project trace conflicts with the generated .meshscale-server.cjs entrypoint");
+    if all_traced_files.contains_key("function-entry.cjs") {
+        bail!("project trace conflicts with the generated function-entry.cjs entrypoint");
     }
     collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
+    if metadata.version == 2 {
+        collect_adapter_assets(
+            project_dir,
+            &project_root,
+            &adapter_metadata,
+            &mut all_traced_files,
+        )?;
+    }
+    if metadata.version == 2 {
+        ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "next")?;
+        ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
+    }
     materialize_package_dependencies(&project_root, &mut all_traced_files)?;
 
     info!(files = all_traced_files.len(), "collected runtime trace");
 
     copy_runtime_files(&runtime_dir, &all_traced_files)?;
-    copy_next_runtime(project_dir, &runtime_dir, &all_traced_files)?;
     copy_required_runtime_files(project_dir, &runtime_dir)?;
+    fs::create_dir_all(runtime_dir.join(".next"))?;
+    if adapter_metadata.is_file() {
+        let destination = runtime_dir.join(".next").join("meshscale-adapter.json");
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("adapter metadata has no parent")?,
+        )?;
+        fs::copy(&adapter_metadata, &destination)
+            .with_context(|| format!("failed to copy {}", adapter_metadata.display()))?;
+    }
     copy_public_assets(project_dir, &static_dir)?;
     copy_next_static(project_dir, &static_dir)?;
     fs::write(
-        runtime_dir.join(".meshscale-server.cjs"),
-        include_str!("next_server.cjs"),
+        runtime_dir.join("function-entry.cjs"),
+        include_str!("function_entry.cjs"),
     )
-    .context("failed to write production Node entrypoint")?;
+    .context("failed to write MeshScale function entrypoint")?;
 
     let manifest = json!({
         "version": metadata.version,
@@ -95,7 +113,7 @@ pub fn create_output(
         "runtime": {
             "type": "node",
             "command": "node",
-            "entrypoint": "runtime/.meshscale-server.cjs",
+            "entrypoint": "runtime/function-entry.cjs",
             "working_directory": "runtime",
             "args": []
         },
@@ -127,19 +145,48 @@ pub fn create_output(
     Ok(output_dir)
 }
 
+fn prepare_output_dir(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    // build.log is opened before artifact generation so the log contains the
+    // complete build lifecycle. Preserve it while replacing the generated
+    // artifact directories/files from the previous build.
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to inspect {}", output_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_name() == "build.log" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_next_trace_files(
     next_dir: &Path,
     project_root: &Path,
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut files = BTreeMap::new();
 
-    for entry in WalkDir::new(next_dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_generated_standalone_tree(entry.path(), next_dir))
-    {
+    for entry in WalkDir::new(next_dir).follow_links(false).into_iter() {
         let entry = entry.context("failed to walk Next.js trace directory")?;
         let path = entry.path();
+        if path
+            .strip_prefix(next_dir)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| component.as_os_str() == "standalone")
+        {
+            continue;
+        }
         if !entry.file_type().is_file() || path.extension().and_then(|v| v.to_str()) != Some("json")
         {
             continue;
@@ -192,11 +239,11 @@ fn collect_entrypoint_trace(
     files: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let mut entrypoint = tempfile::Builder::new()
-        .prefix(".meshscale-entrypoint-")
+        .prefix(".meshscale-function-entrypoint-")
         .suffix(".cjs")
         .tempfile_in(project_dir)
         .context("failed to stage production entrypoint for tracing")?;
-    entrypoint.write_all(include_bytes!("next_server.cjs"))?;
+    entrypoint.write_all(include_bytes!("function_entry.cjs"))?;
     entrypoint.flush()?;
     let entrypoint_source = entrypoint.path().canonicalize()?;
     let script = r#"
@@ -310,6 +357,97 @@ fn collect_trace_entry(
     }
 
     Ok(())
+}
+
+fn collect_adapter_assets(
+    project_dir: &Path,
+    project_root: &Path,
+    metadata_path: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Adapter {
+        outputs: serde_json::Value,
+    }
+
+    let metadata: Adapter = serde_json::from_slice(&fs::read(metadata_path)?)
+        .context("invalid MeshScale adapter metadata")?;
+    let groups = ["pages", "pagesApi", "appPages", "appRoutes"];
+    for group in groups {
+        let Some(outputs) = metadata
+            .outputs
+            .get(group)
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for output in outputs {
+            // Adapter outputs point directly at the server module that handles
+            // the route. Next's NFT traces do not necessarily include this
+            // adapter-owned output file, so it must be copied explicitly.
+            if let Some(file_path) = output.get("filePath").and_then(serde_json::Value::as_str) {
+                let source = project_dir
+                    .join(file_path)
+                    .canonicalize()
+                    .with_context(|| format!("adapter output does not exist: {file_path}"))?;
+                let logical = Path::new(file_path);
+                ensure!(
+                    logical.is_relative()
+                        && logical.components().all(|component| {
+                            matches!(component, std::path::Component::Normal(_))
+                        }),
+                    "invalid adapter output path: {}",
+                    logical.display()
+                );
+                let logical = logical.to_string_lossy().replace('\\', "/");
+                collect_trace_entry(files, project_root, &logical, &source)?;
+            }
+
+            let Some(assets) = output.get("assets").and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for (logical, relative) in assets {
+                let relative = relative
+                    .as_str()
+                    .context("adapter asset path is not a string")?;
+                let source = project_dir
+                    .join(relative)
+                    .canonicalize()
+                    .with_context(|| format!("adapter asset does not exist: {relative}"))?;
+                let logical = Path::new(logical);
+                ensure!(
+                    logical.is_relative()
+                        && logical.components().all(|component| {
+                            matches!(component, std::path::Component::Normal(_))
+                        }),
+                    "invalid adapter asset path: {}",
+                    logical.display()
+                );
+                let logical = logical.to_string_lossy().replace('\\', "/");
+                collect_trace_entry(files, project_root, &logical, &source)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_runtime_package_manifest(
+    project_root: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+    package_name: &str,
+) -> Result<()> {
+    let source = project_root
+        .join("node_modules")
+        .join(package_name)
+        .join("package.json");
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("required runtime package is missing: {package_name}"))?;
+    let logical = Path::new("node_modules")
+        .join(package_name)
+        .join("package.json");
+    let logical = logical.to_string_lossy().replace('\\', "/");
+    collect_trace_entry(files, project_root, &logical, &source)
 }
 
 fn materialize_package_dependencies(
@@ -561,61 +699,6 @@ fn copy_runtime_files(runtime_dir: &Path, files: &BTreeMap<String, PathBuf>) -> 
                 destination.display()
             )
         })?;
-    }
-
-    Ok(())
-}
-
-fn copy_next_runtime(
-    project_dir: &Path,
-    runtime_dir: &Path,
-    traced: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    let source = project_dir.join(".next");
-    let destination = runtime_dir.join(".next");
-    copy_tree_excluding_generated(&source, &destination, traced)
-}
-
-fn is_generated_standalone_tree(path: &Path, next_dir: &Path) -> bool {
-    path.strip_prefix(next_dir)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .is_some_and(|component| component.as_os_str() == "standalone")
-}
-
-fn copy_tree_excluding_generated(
-    source: &Path,
-    destination: &Path,
-    traced: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-
-    let walker = WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.path().file_name().and_then(|name| name.to_str());
-            name != Some("cache")
-                && name != Some("standalone")
-                && !name.is_some_and(|name| name.ends_with(".nft.json"))
-        });
-
-    for entry in walker {
-        let entry = entry.context("failed to walk Next.js runtime directory")?;
-        let logical = Path::new(".next")
-            .join(
-                entry
-                    .path()
-                    .strip_prefix(source)
-                    .context("invalid Next.js runtime path")?,
-            )
-            .to_string_lossy()
-            .replace('\\', "/");
-        if traced.contains_key(&logical) {
-            continue;
-        }
-        copy_entry(source, destination, entry.path())?;
     }
 
     Ok(())
@@ -1010,64 +1093,6 @@ mod tests {
         write_trace(workspace.path(), &["../../outside"])?;
         let error = collect_next_trace_files(&root.join(".next"), &root).unwrap_err();
         assert!(format!("{error:#}").contains("escapes the build project root"));
-        Ok(())
-    }
-
-    #[test]
-    fn omits_build_only_files_and_does_not_recopy_traced_next_files() -> Result<()> {
-        let workspace = TempDir::new()?;
-        let project = workspace.path().join("repo");
-        let runtime = workspace.path().join("runtime");
-        write_file(
-            &project.join(".next").join("cache").join("large-cache"),
-            "cache",
-        )?;
-        write_file(
-            &project.join(".next").join("standalone").join("server.js"),
-            "standalone",
-        )?;
-        write_file(
-            &project.join(".next").join("page.js.nft.json"),
-            r#"{"files":[]}"#,
-        )?;
-        write_file(
-            &project.join(".next").join("server").join("page.js"),
-            "source",
-        )?;
-        write_file(
-            &project.join(".next").join("server").join("page.html"),
-            "static page",
-        )?;
-        write_file(
-            &runtime.join(".next").join("server").join("page.js"),
-            "already copied",
-        )?;
-        let traced = BTreeMap::from([(
-            ".next/server/page.js".to_owned(),
-            project.join(".next").join("server").join("page.js"),
-        )]);
-        copy_next_runtime(&project, &runtime, &traced)?;
-        assert_eq!(
-            fs::read_to_string(runtime.join(".next").join("server").join("page.js"))?,
-            "already copied"
-        );
-        assert_eq!(
-            fs::read_to_string(runtime.join(".next").join("server").join("page.html"))?,
-            "static page"
-        );
-        let paths = WalkDir::new(runtime.join(".next"))
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|entry| entry.file_type().is_file())
-                .count(),
-            2
-        );
-        assert!(!runtime.join(".next").join("cache").exists());
-        assert!(!runtime.join(".next").join("standalone").exists());
-        assert!(!runtime.join(".next").join("page.js.nft.json").exists());
         Ok(())
     }
 

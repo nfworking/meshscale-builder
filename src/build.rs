@@ -14,7 +14,10 @@ use tracing::{info, warn};
 use crate::artifact::create_output;
 use crate::{BuildArgs, BuildMetadata, Framework, PackageManager};
 
-pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
+pub fn build_application(
+    args: &BuildArgs,
+    progress: &crate::cli::BuildProgress,
+) -> Result<(BuildMetadata, PathBuf)> {
     validate_args(args)?;
 
     let workspace = TempDir::new().context("failed to create temporary build workspace")?;
@@ -26,8 +29,8 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
         "cloning repository"
     );
 
-    clone_repository(args, &repo_dir)?;
-    checkout_commit(&repo_dir, &args.git_hash)?;
+    progress.step("Cloning repository", || clone_repository(args, &repo_dir))?;
+    progress.step("Checking out commit", || checkout_commit(&repo_dir, &args.git_hash))?;
 
     let project_dir = resolve_project_dir(&repo_dir, &args.dir)?;
     let package_json = load_package_json(&project_dir.join("package.json"))?;
@@ -41,8 +44,15 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
         "detected build configuration"
     );
 
-    install_dependencies(&project_dir, package_manager)?;
-    run_build(&project_dir, package_manager, &package_json)?;
+    progress.step("Installing dependencies", || {
+        install_dependencies(&project_dir, package_manager)
+    })?;
+    progress.step("Preparing Next.js adapter", || {
+        install_adapter_runtime_dependency(&project_dir, package_manager)
+    })?;
+    progress.step("Building application", || {
+        run_build(&project_dir, package_manager, &package_json)
+    })?;
 
     let metadata = BuildMetadata {
         version: 2,
@@ -60,7 +70,9 @@ pub fn build_application(args: &BuildArgs) -> Result<(BuildMetadata, PathBuf)> {
         project_id: args.destination.project_id.clone(),
     };
 
-    let output_dir = create_output(&project_dir, &metadata, &args.output)?;
+    let output_dir = progress.step("Packaging deployment artifact", || {
+        create_output(&project_dir, &metadata, &args.output)
+    })?;
     Ok((metadata, output_dir))
 }
 
@@ -70,7 +82,6 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
         ("git-repo", args.git_repo.as_str()),
         ("git-hash", args.git_hash.as_str()),
         ("git-branch", args.git_branch.as_str()),
-        ("access-token", args.access_token.as_str()),
         ("build-id", args.build_id.as_str()),
     ] {
         if value.trim().is_empty() {
@@ -102,40 +113,84 @@ fn validate_args(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_github_token(args: &BuildArgs) -> Result<Option<String>> {
+    if let Some(token) = args.access_token.as_deref() {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("--access-token cannot be empty");
+        }
+        return Ok(Some(token.to_owned()));
+    }
+
+    match std::env::var("MESHSCALE_GITHUB_TOKEN") {
+        Ok(token) => {
+            let token = token.trim();
+            if token.is_empty() {
+                bail!("MESHSCALE_GITHUB_TOKEN cannot be empty");
+            }
+            Ok(Some(token.to_owned()))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("MESHSCALE_GITHUB_TOKEN is not valid UTF-8")
+        }
+    }
+}
+
 fn clone_repository(args: &BuildArgs, destination: &Path) -> Result<Repository> {
     let url = format!(
         "https://github.com/{}/{}.git",
         args.git_username, args.git_repo
     );
-    let token = args.access_token.clone();
-
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |_url, _username_from_url, allowed_types| {
-        if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            Cred::userpass_plaintext("x-access-token", &token)
-        } else {
-            Err(git2::Error::from_str(
-                "GitHub HTTPS authentication requires USER_PASS_PLAINTEXT credentials",
-            ))
-        }
-    });
+    let token = resolve_github_token(args)?;
 
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
+    if let Some(token) = token.as_deref() {
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(move |_url, _username_from_url, allowed_types| {
+            if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
+                Cred::userpass_plaintext("x-access-token", token)
+            } else {
+                Err(git2::Error::from_str(
+                    "GitHub HTTPS authentication requires USER_PASS_PLAINTEXT credentials",
+                ))
+            }
+        });
+        fetch_options.remote_callbacks(callbacks);
+        info!(authenticated = true, "cloning GitHub repository with supplied credentials");
+    } else {
+        info!(authenticated = false, "cloning GitHub repository anonymously; private repositories require a GitHub token");
+    }
 
     let mut builder = RepoBuilder::new();
     builder.branch(&args.git_branch);
     builder.fetch_options(fetch_options);
 
     builder.clone(&url, destination).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to clone GitHub repository {}/{}: {} (class: {:?}, code: {:?})",
-            args.git_username,
-            args.git_repo,
-            error.message(),
-            error.class(),
-            error.code()
-        )
+        if error.code() == git2::ErrorCode::Auth {
+            if token.is_some() {
+                anyhow::anyhow!(
+                    "GitHub authentication failed for {}/{}; verify the token has read access to this repository",
+                    args.git_username,
+                    args.git_repo
+                )
+            } else {
+                anyhow::anyhow!(
+                    "GitHub repository {}/{} requires authentication; provide --access-token or MESHSCALE_GITHUB_TOKEN",
+                    args.git_username,
+                    args.git_repo
+                )
+            }
+        } else {
+            anyhow::anyhow!(
+                "failed to clone GitHub repository {}/{}: {} (class: {:?}, code: {:?})",
+                args.git_username,
+                args.git_repo,
+                error.message(),
+                error.class(),
+                error.code()
+            )
+        }
     })
 }
 
@@ -180,9 +235,18 @@ fn resolve_project_dir(repo_dir: &Path, dir: &str) -> Result<PathBuf> {
         bail!("--dir is not a directory: {}", canonical_project.display());
     }
 
-    Ok(canonical_project)
+    // canonicalize() may produce an extended-length Windows path (\\?\\C:\\...).
+    // Node.js/Next.js can mis-handle that form and report EISDIR on the drive
+    // component ("lstat 'C:'"). We only need the canonical path for the
+    // containment/security check above. Return the original joined path to
+    // Node-facing commands so Rust does not re-emit the verbatim prefix when
+    // constructing the adapter path or changing the working directory.
+    //
+    // The containment check above is still performed against canonical paths,
+    // and project_dir was constructed directly under repo_dir with '..' already
+    // rejected, so returning it does not weaken the security boundary.
+    Ok(project_dir)
 }
-
 fn load_package_json(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("package.json not found at {}", path.display()))?;
@@ -243,6 +307,97 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
     run_command(executable, &args, project_dir, "dependency installation")
 }
 
+fn install_adapter_runtime_dependency(
+    project_dir: &Path,
+    package_manager: PackageManager,
+) -> Result<()> {
+    let next_package = project_dir
+        .join("node_modules")
+        .join("next")
+        .join("package.json");
+    let package: Value = serde_json::from_slice(
+        &fs::read(&next_package)
+            .with_context(|| format!("failed to read {}", next_package.display()))?,
+    )
+    .context("installed Next.js package.json is invalid")?;
+    let version = package
+        .get("version")
+        .and_then(Value::as_str)
+        .context("installed Next.js package.json is missing version")?;
+
+    // @next/routing is released independently from Next.js, so an exact
+    // @next/routing@<next-version> install can fail even when that Next.js
+    // version is valid. Keep routing on the same stable major/minor line.
+    let spec = adapter_routing_spec(version)?;
+    let (executable, args) = adapter_routing_install_command(package_manager, &spec);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    info!(
+        next_version = version,
+        routing_spec = %spec,
+        package_manager = package_manager.as_str(),
+        command = %format_command(executable, &arg_refs),
+        "installing Next.js adapter routing runtime"
+    );
+    run_command(executable, &arg_refs, project_dir, "adapter routing installation")
+}
+
+fn adapter_routing_install_command(
+    package_manager: PackageManager,
+    spec: &str,
+) -> (&'static str, Vec<String>) {
+    let executable = package_manager.executable();
+    let args = match package_manager {
+        // The build workspace is disposable, so there is no reason to write
+        // a package lock or persist the temporary adapter dependency.
+        PackageManager::Npm => vec![
+            "install".into(),
+            "--no-save".into(),
+            "--package-lock=false".into(),
+            "--ignore-scripts".into(),
+            spec.into(),
+        ],
+        PackageManager::Pnpm => vec![
+            "add".into(),
+            "--lockfile=false".into(),
+            "--ignore-scripts".into(),
+            spec.into(),
+        ],
+        PackageManager::Yarn => vec![
+            "add".into(),
+            "--ignore-scripts".into(),
+            "--mode=skip-builds".into(),
+            spec.into(),
+        ],
+    };
+    (executable, args)
+}
+
+fn adapter_routing_spec(next_version: &str) -> Result<String> {
+    let stable = next_version
+        .split_once('-')
+        .map_or(next_version, |(version, _)| version);
+    let mut components = stable.split('.');
+    let major = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid major component")?;
+    let minor = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid minor component")?;
+    let _patch = components
+        .next()
+        .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        .context("installed Next.js version has an invalid patch component")?;
+
+    if components.next().is_some() {
+        bail!("installed Next.js version is not a valid semver version: {next_version}");
+    }
+
+    // ~M.m.0 allows routing patch releases to move independently while
+    // preventing an accidental minor-version jump.
+    Ok(format!("@next/routing@~{major}.{minor}.0"))
+}
 fn run_build(
     project_dir: &Path,
     package_manager: PackageManager,
@@ -260,36 +415,41 @@ fn run_build(
     let executable = package_manager.executable();
     let args = package_manager.build_args();
 
+    let adapter_path = project_dir.join(".meshscale-next-adapter.cjs");
+    fs::write(&adapter_path, include_str!("next_adapter.cjs"))
+        .context("failed to stage MeshScale Next.js adapter")?;
+
     info!(
         command = %format_command(executable, &args),
-        "building application with the project's normal Next.js build"
+        adapter = %adapter_path.display(),
+        "building application through the MeshScale Next.js adapter"
     );
 
-    run_command(executable, &args, project_dir, "application build")
-}
-
-fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
     let mut command = Command::new(executable);
     crate::upload::remove_credentials(&mut command);
     let status = command
-        .args(args)
-        .current_dir(cwd)
+        .args(&args)
+        .current_dir(project_dir)
         .env("CI", "true")
+        .env("NEXT_ADAPTER_PATH", &adapter_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .with_context(|| {
             format!(
-                "failed to start {operation}: {}",
-                format_command(executable, args)
+                "failed to start application build: {}",
+                format_command(executable, &args)
             )
-        })?;
+        });
 
-    if !status.success() {
+    let _ = fs::remove_file(&adapter_path);
+    let output = status?;
+    log_child_output("application build", &output);
+    if !output.status.success() {
         bail!(
-            "{operation} failed with exit status {}",
-            status.code().map_or_else(
+            "application build failed with exit status {}",
+            output.status.code().map_or_else(
                 || "terminated by signal".to_owned(),
                 |code| code.to_string()
             )
@@ -299,9 +459,132 @@ fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> 
     Ok(())
 }
 
+fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
+    let mut command = Command::new(executable);
+    crate::upload::remove_credentials(&mut command);
+    let output = command
+        .args(args)
+        .current_dir(cwd)
+        .env("CI", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to start {operation}: {}",
+                format_command(executable, args)
+            )
+        })?;
+
+    log_child_output(operation, &output);
+    if !output.status.success() {
+        bail!(
+            "{operation} failed with exit status {}",
+            output.status.code().map_or_else(
+                || "terminated by signal".to_owned(),
+                |code| code.to_string()
+            )
+        );
+    }
+
+    Ok(())
+}
+
+fn log_child_output(operation: &str, output: &std::process::Output) {
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        tracing::info!(stream = "stdout", operation = %operation, "{line}");
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        tracing::info!(stream = "stderr", operation = %operation, "{line}");
+    }
+}
+
 fn format_command(executable: &str, args: &[&str]) -> String {
     std::iter::once(executable)
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{adapter_routing_install_command, adapter_routing_spec};
+
+    
+    #[test]
+    fn adapter_routing_uses_detected_package_manager() {
+        let (npm, npm_args) =
+            adapter_routing_install_command(super::PackageManager::Npm, "@next/routing@~16.3.0");
+        assert_eq!(npm, "npm");
+        assert_eq!(
+            npm_args,
+            vec![
+                "install",
+                "--no-save",
+                "--package-lock=false",
+                "--ignore-scripts",
+                "@next/routing@~16.3.0"
+            ]
+        );
+
+        let (pnpm, pnpm_args) =
+            adapter_routing_install_command(super::PackageManager::Pnpm, "@next/routing@~16.3.0");
+        assert_eq!(pnpm, "pnpm");
+        assert_eq!(
+            pnpm_args,
+            vec![
+                "add",
+                "--lockfile=false",
+                "--ignore-scripts",
+                "@next/routing@~16.3.0"
+            ]
+        );
+
+        let (yarn, yarn_args) =
+            adapter_routing_install_command(super::PackageManager::Yarn, "@next/routing@~16.3.0");
+        assert_eq!(yarn, "yarn");
+        assert_eq!(
+            yarn_args,
+            vec![
+                "add",
+                "--ignore-scripts",
+                "--mode=skip-builds",
+                "@next/routing@~16.3.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn adapter_routing_uses_same_major_minor_line() {
+        assert_eq!(
+            adapter_routing_spec("16.3.4").unwrap(),
+            "@next/routing@~16.3.0"
+        );
+        assert_eq!(
+            adapter_routing_spec("16.3.8").unwrap(),
+            "@next/routing@~16.3.0"
+        );
+        assert_eq!(
+            adapter_routing_spec("16.4.0").unwrap(),
+            "@next/routing@~16.4.0"
+        );
+    }
+
+    #[test]
+    fn adapter_routing_strips_prerelease_suffix() {
+        assert_eq!(
+            adapter_routing_spec("16.4.0-canary.12").unwrap(),
+            "@next/routing@~16.4.0"
+        );
+    }
+
+    #[test]
+    fn adapter_routing_rejects_invalid_versions() {
+        assert!(adapter_routing_spec("16").is_err());
+        assert!(adapter_routing_spec("16.x.4").is_err());
+        assert!(adapter_routing_spec("16.3").is_err());
+        assert!(adapter_routing_spec("16.3.4.1").is_err());
+    }
+}
+

@@ -1,0 +1,26 @@
+name: Arch GPT builder checks
+
+on:
+  push:
+    branches:
+      - arch/gpt
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Node entrypoint syntax
+        run: node --check src/function_entry.cjs
+      - name: Compile
+        run: cargo check --all-targets
+      - name: Tests
+        run: cargo test --all-targets

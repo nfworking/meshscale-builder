@@ -1,15 +1,21 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
-use std::{path::PathBuf, time::Instant};
-use tracing_subscriber::EnvFilter;
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod artifact;
 mod build;
 mod cache;
+mod cli;
 mod manifest;
 mod routing;
-mod runtime;
+mod runner;
 mod static_output;
 mod stats;
 mod upload;
@@ -33,7 +39,7 @@ enum Commands {
     /// Build a deployment artifact and upload it to R2 unless --no-upload is set.
     Build(BuildArgs),
     /// Serve static assets and proxy dynamic requests to a managed Node runtime.
-    Run(runtime::RunArgs),
+    Run(runner::RunArgs),
     /// Upload a previously built output to an immutable R2 deployment prefix.
     Upload(upload::UploadArgs),
 }
@@ -55,9 +61,10 @@ pub struct BuildArgs {
     /// Branch to clone.
     #[arg(long = "git-branch")]
     pub git_branch: String,
-    /// GitHub token used for repository authentication.
-    #[arg(long = "access-token")]
-    pub access_token: String,
+    /// Optional GitHub token for private repository access.
+    /// Prefer MESHSCALE_GITHUB_TOKEN so the credential is not exposed in process arguments.
+    #[arg(long = "access-token", value_name = "TOKEN")]
+    pub access_token: Option<String>,
     /// MeshScale build identifier.
     #[arg(long = "build-id")]
     pub build_id: String,
@@ -96,27 +103,9 @@ pub enum PackageManager {
 impl PackageManager {
     pub fn executable(self) -> &'static str {
         match self {
-            Self::Npm => {
-                if cfg!(windows) {
-                    "npm.cmd"
-                } else {
-                    "npm"
-                }
-            }
-            Self::Pnpm => {
-                if cfg!(windows) {
-                    "pnpm.cmd"
-                } else {
-                    "pnpm"
-                }
-            }
-            Self::Yarn => {
-                if cfg!(windows) {
-                    "yarn.cmd"
-                } else {
-                    "yarn"
-                }
-            }
+            Self::Npm => if cfg!(windows) { "npm.cmd" } else { "npm" },
+            Self::Pnpm => if cfg!(windows) { "pnpm.cmd" } else { "pnpm" },
+            Self::Yarn => if cfg!(windows) { "yarn.cmd" } else { "yarn" },
         }
     }
 
@@ -166,32 +155,22 @@ impl BuildMetadata {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct BuildResult {
-    status: &'static str,
-    build_id: String,
-    framework: Option<&'static str>,
-    package_manager: Option<&'static str>,
-    output_path: Option<String>,
-    build_time_ms: u128,
-    error: Option<String>,
-    upload: Option<upload::UploadResult>,
+struct FileLogGuard {
+    _guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "meshscale_builder=info".into()),
-        )
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Build(args) => run_build(args, cli.env_file.as_deref()),
-        Commands::Run(args) => runtime::run(args),
-        Commands::Upload(args) => upload::upload(args, cli.env_file.as_deref()),
+        Commands::Run(args) => {
+            init_terminal_logging();
+            runner::run(args)
+        }
+        Commands::Upload(args) => {
+            init_terminal_logging();
+            upload::upload(args, cli.env_file.as_deref())
+        }
     };
 
     if let Err(error) = result {
@@ -200,67 +179,171 @@ fn main() {
     }
 }
 
+fn init_terminal_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "meshscale_builder=info".into()),
+        )
+        .with_target(false)
+        .try_init();
+}
+
+fn init_build_logging(output: &Path) -> Result<FileLogGuard> {
+    fs::create_dir_all(output)?;
+    let log_path = output.join("build.log");
+    let _ = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&log_path)?;
+    let appender = tracing_appender::rolling::never(output, "build.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(appender);
+
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "meshscale_builder=info".into());
+
+    // Build tracing is intentionally file-only. The terminal is owned exclusively
+    // by the custom BuildProgress UI below; internal stage logs must never leak into it.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file_writer)
+                .with_target(true)
+                .with_ansi(false)
+                .with_thread_ids(true)
+                .with_thread_names(true),
+        )
+        .with(env_filter)
+        .try_init()?;
+
+    Ok(FileLogGuard { _guard: guard })
+}
+
 fn run_build(args: BuildArgs, env_file: Option<&std::path::Path>) -> Result<()> {
     let started = Instant::now();
     let build_id = args.build_id.clone();
+    let output_path = if args.output.is_absolute() {
+        args.output.clone()
+    } else {
+        std::env::current_dir()?.join(&args.output)
+    };
+    let _log_guard = init_build_logging(&output_path)?;
+
+    tracing::info!(
+        build_id = %args.build_id,
+        project_id = ?args.destination.project_id,
+        repository = %format!("{}/{}", args.git_username, args.git_repo),
+        commit = %args.git_hash,
+        branch = %args.git_branch,
+        "build started"
+    );
+
+    let progress = cli::BuildProgress::new();
+
+    println!();
+    println!("MeshScale Build");
+    println!("───────────────");
+    println!("  build     {}", args.build_id);
+    println!(
+        "  project   {}",
+        args.destination.project_id.as_deref().unwrap_or("—")
+    );
+    println!();
 
     let build = (|| {
-        upload::validate_id("build-id", &args.build_id)?;
+        progress.step("Validating build configuration", || {
+            upload::validate_id("build-id", &args.build_id)?;
+            if args.no_upload {
+                args.destination.validate_optional()?;
+            } else {
+                args.destination.validate()?;
+            }
+            Ok(())
+        })?;
+
         let config = if args.no_upload {
-            args.destination.validate_optional()?;
             None
         } else {
-            args.destination.validate()?;
-            Some(upload::R2Config::load(env_file)?)
+            Some(progress.step("Loading upload configuration", || {
+                upload::R2Config::load(env_file)
+            })?)
         };
-        let (metadata, output_path) = build::build_application(&args)?;
-        let uploaded = config
-            .map(|config| {
+
+        let (metadata, output_path) =
+            build::build_application(&args, &progress)?;
+
+        let uploaded = if let Some(config) = config {
+            Some(progress.step("Uploading deployment artifact", || {
                 upload::upload_output(
                     &output_path,
                     &args.destination,
                     Some(&args.build_id),
                     config,
                 )
-            })
-            .transpose();
+            })?)
+        } else {
+            None
+        };
+
         Ok::<_, anyhow::Error>((metadata, output_path, uploaded))
     })();
+
     match build {
         Ok((metadata, output_path, uploaded)) => {
-            let error = uploaded.as_ref().err().map(|error| format!("{error:#}"));
-            let succeeded = error.is_none();
-            let result = BuildResult {
-                status: if succeeded { "success" } else { "failed" },
-                build_id,
-                framework: Some(metadata.framework.as_str()),
-                package_manager: Some(metadata.package_manager.as_str()),
-                output_path: Some(output_path.display().to_string()),
-                build_time_ms: started.elapsed().as_millis(),
-                error,
-                upload: uploaded.ok().flatten(),
-            };
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            if !succeeded {
-                anyhow::bail!(
-                    "build succeeded but upload failed; local artifact remains at {}",
-                    output_path.display()
-                );
+            let elapsed = started.elapsed();
+            let static_size = cli::output_size(&output_path.join("static"))?;
+            let runtime_size = cli::output_size(&output_path.join("runtime"))?;
+
+            tracing::info!(
+                build_id = %metadata.build_id,
+                project_id = ?metadata.project_id,
+                static_bytes = static_size,
+                runtime_bytes = runtime_size,
+                build_time_ms = elapsed.as_millis(),
+                "build completed"
+            );
+
+            println!();
+            println!("✓ Build completed");
+            println!();
+            println!("  Build ID        {}", metadata.build_id);
+            println!(
+                "  Project ID      {}",
+                metadata.project_id.as_deref().unwrap_or("—")
+            );
+            println!("  Framework       {}", metadata.framework.as_str());
+            println!("  Package manager {}", metadata.package_manager.as_str());
+            println!("  Static size     {}", cli::format_bytes(static_size));
+            println!("  Runtime size    {}", cli::format_bytes(runtime_size));
+            println!("  Build time      {}", cli::format_duration(elapsed));
+            println!("  Output          {}", output_path.display());
+            if uploaded.is_some() {
+                println!("  Upload          complete");
+            } else {
+                println!("  Upload          skipped");
             }
+            println!();
+
+            // Make the final record immediately useful when the command is piped,
+            // while keeping the normal terminal output human-first.
+            io::stdout().flush()?;
+
             Ok(())
         }
         Err(error) => {
-            let result = BuildResult {
-                status: "failed",
-                build_id,
-                framework: None,
-                package_manager: None,
-                output_path: None,
-                build_time_ms: started.elapsed().as_millis(),
-                error: Some(error.to_string()),
-                upload: None,
-            };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            let elapsed = started.elapsed();
+            tracing::error!(
+                build_id = %build_id,
+                elapsed_ms = elapsed.as_millis(),
+                error = %format!("{error:#}"),
+                "build failed"
+            );
+            eprintln!();
+            eprintln!("✗ Build failed");
+            eprintln!("  {error:#}");
+            eprintln!();
+            eprintln!("  Detailed log: {}", output_path.join("build.log").display());
             std::process::exit(1);
         }
     }
@@ -328,22 +411,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_defaults_and_custom_ports() {
-        for (extra, expected) in [
-            (vec![], (3000, 3100)),
-            (
-                vec!["--port", "8080", "--runtime-port", "8100"],
-                (8080, 8100),
-            ),
-        ] {
-            let mut args = vec!["meshscale-builder", "run", ".meshscale/output"];
-            args.extend(extra);
-            let cli = Cli::try_parse_from(args).unwrap();
-            let Commands::Run(args) = cli.command else {
-                panic!("expected run command");
-            };
-            assert_eq!((args.port, args.runtime_port), expected);
-        }
+    fn parses_run_defaults_and_projects() {
+        let cli = Cli::try_parse_from([
+            "meshscale-builder",
+            "run",
+            ".meshscale/output",
+            "--port",
+            "8080",
+        ])
+        .unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.output, Some(PathBuf::from(".meshscale/output")));
+        assert_eq!(args.port, 8080);
+        assert!(args.projects.is_empty());
+
+        let cli = Cli::try_parse_from([
+            "meshscale-builder",
+            "run",
+            "--project",
+            "app.localhost=./app-output",
+            "--project",
+            "blog.localhost=./blog-output",
+        ])
+        .unwrap();
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.output.is_none());
+        assert_eq!(args.projects.len(), 2);
+
         assert!(
             Cli::try_parse_from([
                 "meshscale-builder",
