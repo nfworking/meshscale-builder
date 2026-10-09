@@ -32,7 +32,7 @@ const S3_PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
-const ENV_NAMES: [&str; 4] = [
+pub(crate) const ENV_NAMES: [&str; 4] = [
     "MESHSCALE_R2_ACCOUNT_ID",
     "MESHSCALE_R2_ACCESS_KEY_ID",
     "MESHSCALE_R2_SECRET_ACCESS_KEY",
@@ -172,7 +172,7 @@ fn resolve_setting(
     Ok(defaults.get(name).or_else(|| defaults.get(&alias)).cloned())
 }
 
-fn load_dotenv(path: Option<&Path>) -> Result<BTreeMap<String, String>> {
+pub(crate) fn load_dotenv(path: Option<&Path>) -> Result<BTreeMap<String, String>> {
     let values = if let Some(path) = path {
         dotenvy::from_path_iter(path)
             .map_err(|_| anyhow::anyhow!("failed to open dotenv file {}", path.display()))?
@@ -277,14 +277,20 @@ fn snapshot(
             .context("artifact path must be UTF-8")?
             .replace('\\', "/");
         manifest::validate_relative(&name)?;
+        // build.log (written by `build`) and lambda/ (written by `package lambda`) are
+        // local-only outputs: accepted here, validated like the rest, never copied.
         ensure!(
             matches!(
                 name.split('/').next(),
-                Some("runtime" | "static" | "manifest.json")
+                Some("runtime" | "static" | "manifest.json" | "build.log" | "lambda")
             ),
             "unexpected artifact entry {name}"
         );
         let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            name != "build.log" || metadata.is_file(),
+            "unexpected artifact entry {name}: build.log must be a file"
+        );
         ensure!(
             !metadata.file_type().is_symlink() && fs::read_link(entry.path()).is_err(),
             "artifact contains a link: {name}"
@@ -1111,6 +1117,76 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
         assert!(format!("{error:#}").contains(".env"));
+        assert!(server.store.lock().unwrap().objects.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_log_and_lambda_package_are_accepted_but_never_uploaded() -> Result<()> {
+        let server = mock_server().await?;
+        let output = fixture()?;
+        fs::write(output.path().join("build.log"), "build log line")?;
+        fs::create_dir_all(output.path().join("lambda"))?;
+        fs::write(output.path().join("lambda").join("lambda.zip"), "zip")?;
+        let result = upload_async(
+            output.path(),
+            &destination(),
+            None,
+            config(server.endpoint.clone()),
+        )
+        .await?;
+        assert_eq!(result.files, 4);
+        let store = server.store.lock().unwrap();
+        assert!(
+            !store
+                .objects
+                .keys()
+                .any(|key| key.contains("build.log") || key.contains("lambda"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unexpected_top_level_entries_are_still_rejected() -> Result<()> {
+        let server = mock_server().await?;
+        for (name, is_dir) in [
+            ("build.log.old", false),
+            ("lambda.zip", false),
+            ("logs", true),
+        ] {
+            let output = fixture()?;
+            let path = output.path().join(name);
+            if is_dir {
+                fs::create_dir_all(&path)?;
+            } else {
+                fs::write(&path, "unexpected")?;
+            }
+            let error = upload_async(
+                output.path(),
+                &destination(),
+                None,
+                config(server.endpoint.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unexpected artifact entry"),
+                "{name}: {error:#}"
+            );
+        }
+        // A directory named build.log is not the build log.
+        let output = fixture()?;
+        fs::create_dir_all(output.path().join("build.log"))?;
+        assert!(
+            upload_async(
+                output.path(),
+                &destination(),
+                None,
+                config(server.endpoint.clone()),
+            )
+            .await
+            .is_err()
+        );
         assert!(server.store.lock().unwrap().objects.is_empty());
         Ok(())
     }

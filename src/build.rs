@@ -19,6 +19,14 @@ pub fn build_application(
     progress: &crate::cli::BuildProgress,
 ) -> Result<(BuildMetadata, PathBuf)> {
     validate_args(args)?;
+    let project_vars = match &args.build_env_file {
+        Some(path) => crate::env::load_build_env_file(path)?,
+        None => Vec::new(),
+    };
+    info!(
+        project_vars = project_vars.len(),
+        "loaded build environment (values are not logged)"
+    );
 
     let workspace = TempDir::new().context("failed to create temporary build workspace")?;
     let repo_dir = workspace.path().join("repo");
@@ -45,13 +53,13 @@ pub fn build_application(
     );
 
     progress.step("Installing dependencies", || {
-        install_dependencies(&project_dir, package_manager)
+        install_dependencies(&project_dir, package_manager, &project_vars)
     })?;
     progress.step("Preparing Next.js adapter", || {
-        install_adapter_runtime_dependency(&project_dir, package_manager)
+        install_adapter_runtime_dependency(&project_dir, package_manager, &project_vars)
     })?;
     progress.step("Building application", || {
-        run_build(&project_dir, package_manager, &package_json)
+        run_build(&project_dir, package_manager, &package_json, &project_vars)
     })?;
 
     let metadata = BuildMetadata {
@@ -295,7 +303,11 @@ fn detect_package_manager(project_dir: &Path, package_json: &Value) -> Result<Pa
     Ok(PackageManager::Npm)
 }
 
-fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> Result<()> {
+fn install_dependencies(
+    project_dir: &Path,
+    package_manager: PackageManager,
+    project_vars: &[(String, String)],
+) -> Result<()> {
     let has_lockfile = project_dir.join("package-lock.json").is_file()
         || project_dir.join("pnpm-lock.yaml").is_file()
         || project_dir.join("yarn.lock").is_file();
@@ -304,12 +316,19 @@ fn install_dependencies(project_dir: &Path, package_manager: PackageManager) -> 
     let args = package_manager.install_args(has_lockfile);
 
     info!(command = %format_command(executable, &args), "installing dependencies");
-    run_command(executable, &args, project_dir, "dependency installation")
+    run_command(
+        executable,
+        &args,
+        project_dir,
+        "dependency installation",
+        project_vars,
+    )
 }
 
 fn install_adapter_runtime_dependency(
     project_dir: &Path,
     package_manager: PackageManager,
+    project_vars: &[(String, String)],
 ) -> Result<()> {
     let next_package = project_dir
         .join("node_modules")
@@ -338,7 +357,13 @@ fn install_adapter_runtime_dependency(
         command = %format_command(executable, &arg_refs),
         "installing Next.js adapter routing runtime"
     );
-    run_command(executable, &arg_refs, project_dir, "adapter routing installation")
+    run_command(
+        executable,
+        &arg_refs,
+        project_dir,
+        "adapter routing installation",
+        project_vars,
+    )
 }
 
 fn adapter_routing_install_command(
@@ -402,6 +427,7 @@ fn run_build(
     project_dir: &Path,
     package_manager: PackageManager,
     package_json: &Value,
+    project_vars: &[(String, String)],
 ) -> Result<()> {
     let scripts = package_json
         .get("scripts")
@@ -426,7 +452,7 @@ fn run_build(
     );
 
     let mut command = Command::new(executable);
-    crate::upload::remove_credentials(&mut command);
+    crate::env::restrict_build_env(&mut command, project_vars);
     let status = command
         .args(&args)
         .current_dir(project_dir)
@@ -459,9 +485,15 @@ fn run_build(
     Ok(())
 }
 
-fn run_command(executable: &str, args: &[&str], cwd: &Path, operation: &str) -> Result<()> {
+fn run_command(
+    executable: &str,
+    args: &[&str],
+    cwd: &Path,
+    operation: &str,
+    project_vars: &[(String, String)],
+) -> Result<()> {
     let mut command = Command::new(executable);
-    crate::upload::remove_credentials(&mut command);
+    crate::env::restrict_build_env(&mut command, project_vars);
     let output = command
         .args(args)
         .current_dir(cwd)

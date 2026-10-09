@@ -115,7 +115,7 @@ pub fn generate(project: &Path, output: &Path, manifest: &mut Manifest) -> Resul
     manifest.deployment.next_build_id =
         Some(fs::read_to_string(next.join("BUILD_ID"))?.trim().into());
     let mut command = Command::new("node");
-    crate::upload::remove_credentials(&mut command);
+    crate::env::restrict_build_env(&mut command, &[]);
     let node = command
         .args([
             "-e",

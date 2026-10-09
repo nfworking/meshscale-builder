@@ -80,6 +80,19 @@ The output defaults to .meshscale/output and can be changed with --output.
 
 Build uploads by default and requires organization/project IDs and R2 configuration. It checks those settings before cloning/installing. For credential-free local build/run testing, append `--no-upload`; organization/project IDs are optional in that mode (but must be supplied together). Build records supplied IDs in `manifest.json`.
 
+### Build environment
+
+Dependency installation, the `@next/routing` install, `next build`, entrypoint tracing and the Node version probe run with a cleared environment. Only this allowlist is inherited from the builder's own environment: `PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, `TMPDIR`/`TEMP`/`TMP`, `CI`, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (either case), `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and on Windows `SystemRoot`, `SYSTEMDRIVE`, `COMSPEC`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOMEDRIVE`, `HOMEPATH`, `ProgramFiles`, `ProgramFiles(x86)`. Everything else, including `AWS_*`, cloud tokens, `MESHSCALE_GITHUB_TOKEN` and the R2 settings, never reaches customer install scripts or the build.
+
+Project build-time variables (for example `NEXT_PUBLIC_*`) and package-manager settings (for example `npm_config_*` or a private registry token) must be passed explicitly with `--build-env-file <path>` (dotenv syntax). They are not inherited from the builder's environment. The file:
+
+- must not contain `$` outside comment lines (dotenv expansion would read the builder's own environment and could copy its credentials into the build);
+- must not set `AWS_*`, `MESHSCALE_GITHUB_TOKEN` or any R2 setting;
+- overrides allowlisted variables with the same name;
+- is never logged (only the number of variables is recorded), and parse errors do not echo its content.
+
+`run` is different: the local runner's worker inherits the developer's environment (minus the GitHub token and R2 settings) so applications can use their own runtime configuration.
+
 ### GitHub repository access
 
 GitHub authentication is optional. Public repositories are cloned anonymously. Private repositories require a token with read access to the repository; if an unauthenticated clone is rejected by GitHub, the builder reports that authentication is required instead of silently treating the repository as missing.
@@ -91,11 +104,11 @@ $env:MESHSCALE_GITHUB_TOKEN = "github_pat_..."
 .\\meshscale-builder.exe build --git-username nfworking --git-repo example --git-hash 0123456789abcdef0123456789abcdef01234567 --git-branch main --build-id build_123 --no-upload
 ~~~
 
-If both are supplied, `--access-token` takes precedence. The builder never logs the token and strips `MESHSCALE_GITHUB_TOKEN` before launching package-manager/build child processes. In MeshScale production, use a short-lived GitHub App installation token injected by the control plane rather than a long-lived personal token. GitHub recommends GitHub Apps for acting on behalf of an organization or another user and recommends least-privilege, expiring credentials. Fine-grained tokens used for repository access should be limited to the required repository and read-only contents access.
+If both are supplied, `--access-token` takes precedence. The builder never logs the token and does not pass `MESHSCALE_GITHUB_TOKEN` to package-manager/build child processes (see "Build environment"). In MeshScale production, use a short-lived GitHub App installation token injected by the control plane rather than a long-lived personal token. GitHub recommends GitHub Apps for acting on behalf of an organization or another user and recommends least-privilege, expiring credentials. Fine-grained tokens used for repository access should be limited to the required repository and read-only contents access.
 
 Build output is intentionally human-first rather than JSON. The CLI shows each major build stage with a spinner while it is running and a ✓/✗ result when it completes, followed by build ID, project ID, framework, package manager, static size, collective runtime size and a human-readable total build time. Upload progress remains visible when an upload is enabled.
 
-Every build also writes a detailed `build.log` to `.meshscale/output`. The file contains the full tracing output, command execution details and captured stdout/stderr from dependency installation, adapter setup and the application build. The terminal stays concise while the log remains suitable for debugging failed builds. The log is recreated for each build and is preserved while the artifact directories are replaced.
+Every build also writes a detailed `build.log` to `.meshscale/output`. The file contains the full tracing output, command execution details and captured stdout/stderr from dependency installation, adapter setup and the application build. The terminal stays concise while the log remains suitable for debugging failed builds. The log is recreated for each build and is preserved while the artifact directories are replaced. `upload` accepts (and never uploads) a top-level `build.log` file and a top-level `lambda/` directory; any other unexpected top-level entry is rejected.
 
 ## Local runner
 
@@ -260,6 +273,11 @@ The artifact validation rejects symbolic links and Windows junction/reparse-poin
 GitHub repository authentication is optional for public repositories. For private repositories, supply `MESHSCALE_GITHUB_TOKEN` through the builder process environment or use `--access-token` for local development. The production control plane should inject a short-lived GitHub App installation token rather than persist a long-lived personal token. The token is never logged and is removed from child-process environments.
 
 Build execution is not sandboxed yet. Only run builds from repositories that MeshScale is prepared to execute with the privileges of the builder host.
+
+Operational requirements for hosts that run builds (install scripts and `next build` are arbitrary code):
+
+- Block the build process from reaching the instance metadata service (`169.254.169.254`, `fd00:ec2::254`) and container credential endpoints (for example `169.254.170.2`). Clearing environment variables does not help if the build can fetch instance-role credentials over the network.
+- Do not hold deploy credentials (Lambda, IAM, alias management) on build hosts. The builder only needs the GitHub token and the narrowly scoped R2 credentials, and passes neither to child processes.
 
 
 ## Local edge runner

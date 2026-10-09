@@ -13,6 +13,7 @@ mod artifact;
 mod build;
 mod cache;
 mod cli;
+mod env;
 mod manifest;
 mod routing;
 mod runner;
@@ -76,6 +77,11 @@ pub struct BuildArgs {
     /// Build locally without R2 credentials or uploading.
     #[arg(long)]
     pub no_upload: bool,
+    /// Dotenv file with variables for install and build commands (for example NEXT_PUBLIC_*
+    /// or npm_config_*). The builder's own environment is not inherited except for a small
+    /// allowlist (PATH, HOME, locale, temp, proxy and CA settings).
+    #[arg(long, value_name = "PATH")]
+    pub build_env_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -403,7 +409,31 @@ mod tests {
             assert_eq!(args.no_upload, opt_out);
             assert_eq!(args.destination.validate().is_ok(), !opt_out);
             args.destination.validate_optional().unwrap();
+            assert!(args.build_env_file.is_none());
         }
+        let Commands::Build(args) = Cli::try_parse_from([
+            "meshscale-builder",
+            "build",
+            "--git-username",
+            "owner",
+            "--git-repo",
+            "repo",
+            "--git-hash",
+            "1234567",
+            "--git-branch",
+            "main",
+            "--build-id",
+            "build_1",
+            "--no-upload",
+            "--build-env-file",
+            "project.env",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected build");
+        };
+        assert_eq!(args.build_env_file, Some(PathBuf::from("project.env")));
         assert!(
             Cli::try_parse_from(["meshscale-builder", "upload", "output", "--org-id", "org"])
                 .is_err()

@@ -256,7 +256,7 @@ nodeFileTrace([process.argv[1]], {
 }).catch((error) => { console.error(error); process.exit(1); });
 "#;
     let mut command = Command::new("node");
-    crate::upload::remove_credentials(&mut command);
+    crate::env::restrict_build_env(&mut command, &[]);
     let output = command
         .args(["-e", script])
         .arg(
