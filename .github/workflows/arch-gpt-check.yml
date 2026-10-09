@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 22
       - name: Node syntax
-        run: for file in src/*.cjs test/runtime/*.cjs test/golden/*.cjs; do node --check "$file"; done
+        run: for file in src/*.cjs test/runtime/*.cjs test/golden/*.cjs test/lambda/*.cjs test/lambda/*.mjs; do node --check "$file"; done
       - name: Node runtime tests
         run: node --test test/runtime/*.test.cjs
       - name: Compile
