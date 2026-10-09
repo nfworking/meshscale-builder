@@ -1,0 +1,14 @@
+{
+  "_source": "hand-written API Gateway REST (payload 1.0) shape; must be rejected",
+  "resource": "/",
+  "path": "/ssr",
+  "httpMethod": "GET",
+  "headers": {
+    "Host": "example.test"
+  },
+  "requestContext": {
+    "httpMethod": "GET"
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

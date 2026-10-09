@@ -14,12 +14,14 @@ use crate::BuildMetadata;
 /// Runtime files generated into `runtime/` (artifact name, source). Source files use
 /// underscores, artifact names hyphens. `function-entry.cjs` is the IPC entrypoint named by
 /// the manifest and must keep that name.
-const GENERATED_RUNTIME_FILES: [(&str, &str); 2] = [
+const GENERATED_RUNTIME_FILES: [(&str, &str); 4] = [
     ("runtime.cjs", include_str!("runtime.cjs")),
     ("function-entry.cjs", include_str!("function_entry.cjs")),
+    ("lambda-adapter.cjs", include_str!("lambda_adapter.cjs")),
+    ("lambda-entry.cjs", include_str!("lambda_entry.cjs")),
 ];
 /// Generated files that are entrypoints. Their dependency trees are traced together.
-const GENERATED_ENTRYPOINTS: [&str; 1] = ["function-entry.cjs"];
+const GENERATED_ENTRYPOINTS: [&str; 2] = ["function-entry.cjs", "lambda-entry.cjs"];
 
 pub fn create_output(
     project_dir: &Path,
@@ -1100,6 +1102,32 @@ exports.nodeFileTrace = async (files) => {
             "env module"
         );
         Ok(())
+    }
+
+    #[test]
+    fn generated_runtime_has_ipc_and_lambda_entrypoints() {
+        let names = GENERATED_RUNTIME_FILES.map(|(name, _)| name);
+        assert_eq!(
+            names,
+            [
+                "runtime.cjs",
+                "function-entry.cjs",
+                "lambda-adapter.cjs",
+                "lambda-entry.cjs"
+            ]
+        );
+        assert_eq!(
+            GENERATED_ENTRYPOINTS,
+            ["function-entry.cjs", "lambda-entry.cjs"]
+        );
+        for (name, source) in GENERATED_RUNTIME_FILES {
+            assert!(source.starts_with("'use strict';"), "{name}");
+        }
+        // lambda-entry.cjs requires the generated (hyphenated) names, which must exist.
+        let lambda_entry = GENERATED_RUNTIME_FILES[3].1;
+        for required in ["./lambda-adapter.cjs", "./runtime.cjs"] {
+            assert!(lambda_entry.contains(&format!("require('{required}')")));
+        }
     }
 
     #[test]

@@ -663,7 +663,78 @@ mod tests {
             .unwrap_or_else(|| root.join("target").join("meshscale-fixture").join("output"));
         let output = super::create_output(&project, &metadata, &output)?;
         println!("fixture output: {}", output.display());
+
+        // The generated Lambda entrypoint must work from the artifact alone.
+        drop(workspace);
+        let results = invoke_fixture_lambda(&output.join("runtime"), &root.join("test"))?;
+        let status = |index: usize| results[index]["result"]["statusCode"].as_u64();
+        let body = |index: usize| results[index]["result"]["body"].as_str().unwrap_or("");
+        assert_eq!(status(0), Some(200), "probe: {}", results[0]);
+        assert_eq!(status(1), Some(200), "route handler: {}", results[1]);
+        assert_eq!(body(1), r#"{"method":"GET","a":["1","2"]}"#);
+        assert_eq!(status(2), Some(200), "api echo: {}", results[2]);
+        assert!(body(2).contains(r#""cookie":"a=1; b=2""#), "{}", results[2]);
+        assert_eq!(
+            results[2]["result"]["cookies"],
+            serde_json::json!(["first=1; Path=/; HttpOnly", "second=2; Path=/"])
+        );
+        assert_eq!(status(3), Some(502), "big: {}", results[3]);
+        assert_eq!(status(4), Some(500), "error: {}", results[4]);
+        assert_eq!(status(5), Some(200), "after: {}", results[5]);
+        assert_eq!(
+            body(6),
+            r#"{"marker":"done"}"#,
+            "after() finished before return"
+        );
         Ok(())
+    }
+
+    /// Loads `<runtime>/lambda-entry.cjs` in a fresh Node process and invokes it with event
+    /// fixtures pointed at fixture routes. Like Lambda (cwd `/var/task`), the cwd is the
+    /// runtime directory: Next resolves `.next/` against `process.cwd()`.
+    fn invoke_fixture_lambda(
+        runtime: &std::path::Path,
+        test_dir: &std::path::Path,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let script = r#"
+const fs = require('node:fs');
+const path = require('node:path');
+const [runtime, events, out] = process.argv.slice(1);
+const load = (name, overrides) => ({ ...JSON.parse(fs.readFileSync(path.join(events, name + '.json'), 'utf8')), ...overrides });
+const marker = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'meshscale-marker-'));
+process.env.MESHSCALE_FIXTURE_MARKER_DIR = marker;
+const { handler } = require(path.join(runtime, 'lambda-entry.cjs'));
+const cases = [
+  load('probe'),
+  load('get-basic', { rawPath: '/route-handler', rawQueryString: 'a=1&a=2' }),
+  load('post-json', { cookies: ['a=1', 'b=2'] }),
+  load('get-basic', { rawPath: '/big' }),
+  load('get-basic', { rawPath: '/error' }),
+  load('get-basic', { rawPath: '/after', rawQueryString: 'id=lambda' }),
+  load('get-basic', { rawPath: '/after-marker', rawQueryString: 'id=lambda' }),
+];
+(async () => {
+  const results = [];
+  for (const event of cases) results.push({ result: await handler(event, {}) });
+  fs.writeFileSync(out, JSON.stringify(results));
+  fs.rmSync(marker, { recursive: true, force: true });
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"#;
+        let scratch = tempfile::TempDir::new()?;
+        let out = scratch.path().join("results.json");
+        let output = std::process::Command::new("node")
+            .args(["-e", script])
+            .arg(runtime)
+            .arg(test_dir.join("fixtures").join("events"))
+            .arg(&out)
+            .current_dir(runtime)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "lambda-entry invocation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&std::fs::read(&out)?)?)
     }
 
     #[test]

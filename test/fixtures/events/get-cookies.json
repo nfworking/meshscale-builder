@@ -1,0 +1,41 @@
+{
+  "_source": "hand-written from the documented Function URL payload format 2.0 (LAMBDA-PLAN.md Appendix A); replace with a captured event in Phase 5",
+  "version": "2.0",
+  "routeKey": "$default",
+  "rawPath": "/api/echo",
+  "rawQueryString": "",
+  "cookies": [
+    "a=1",
+    "b=2"
+  ],
+  "headers": {
+    "host": "abcdefghijklmnopqrstuvwxyz012345.lambda-url.us-east-1.on.aws",
+    "x-forwarded-host": "app.example.test",
+    "x-forwarded-proto": "https",
+    "x-forwarded-port": "443",
+    "x-forwarded-for": "203.0.113.10",
+    "user-agent": "curl/8.0",
+    "accept": "*/*",
+    "x-amzn-trace-id": "Root=1-6706ff00-0123456789abcdef01234567",
+    "x-multi": "one,two"
+  },
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "abcdefghijklmnopqrstuvwxyz012345",
+    "domainName": "abcdefghijklmnopqrstuvwxyz012345.lambda-url.us-east-1.on.aws",
+    "domainPrefix": "abcdefghijklmnopqrstuvwxyz012345",
+    "requestId": "11111111-2222-3333-4444-555555555555",
+    "routeKey": "$default",
+    "stage": "$default",
+    "time": "09/Oct/2026:12:00:00 +0000",
+    "timeEpoch": 1791547200000,
+    "http": {
+      "method": "GET",
+      "path": "/api/echo",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "203.0.113.10",
+      "userAgent": "curl/8.0"
+    }
+  },
+  "isBase64Encoded": false
+}
