@@ -344,6 +344,8 @@ fn install_adapter_runtime_dependency(
         .and_then(Value::as_str)
         .context("installed Next.js package.json is missing version")?;
 
+    ensure_supported_next(version)?;
+
     // @next/routing is released independently from Next.js, so an exact
     // @next/routing@<next-version> install can fail even when that Next.js
     // version is valid. Keep routing on the same stable major/minor line.
@@ -395,6 +397,32 @@ fn adapter_routing_install_command(
         ],
     };
     (executable, args)
+}
+
+/// The first Next.js release with the stable Adapter API (`NEXT_ADAPTER_PATH`,
+/// `onBuildComplete` with `routing`, `outputs` and `buildId`). 16.0 and 16.1 shipped an alpha
+/// with a different shape.
+pub(crate) const MIN_NEXT_VERSION: (u64, u64, u64) = (16, 2, 0);
+
+/// Fails with a clear message when `version` is older than [`MIN_NEXT_VERSION`].
+/// Prerelease suffixes are ignored (`16.2.0-canary.1` counts as 16.2.0).
+pub(crate) fn ensure_supported_next(version: &str) -> Result<()> {
+    let stable = version
+        .split_once('-')
+        .map_or(version, |(stable, _)| stable);
+    let parts = stable
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()
+        .filter(|parts| parts.len() == 3)
+        .with_context(|| format!("Next.js version {version:?} is not a valid version"))?;
+    let (major, minor, patch) = MIN_NEXT_VERSION;
+    if (parts[0], parts[1], parts[2]) < MIN_NEXT_VERSION {
+        bail!(
+            "Next.js {version} is not supported: MeshScale needs the stable Next.js Adapter API, available from Next.js {major}.{minor}.{patch}"
+        );
+    }
+    Ok(())
 }
 
 fn adapter_routing_spec(next_version: &str) -> Result<String> {
@@ -735,6 +763,20 @@ const cases = [
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(serde_json::from_slice(&std::fs::read(&out)?)?)
+    }
+
+    #[test]
+    fn requires_the_stable_adapter_api() {
+        for supported in ["16.2.0", "16.2.0-canary.3", "16.4.0", "17.0.1"] {
+            super::ensure_supported_next(supported).unwrap();
+        }
+        for old in ["16.1.9", "16.0.0", "15.5.27", "14.2.35"] {
+            let error = super::ensure_supported_next(old).unwrap_err().to_string();
+            assert!(error.contains("16.2.0") && error.contains(old), "{error}");
+        }
+        for invalid in ["16", "16.x.0", "latest", ""] {
+            assert!(super::ensure_supported_next(invalid).is_err());
+        }
     }
 
     #[test]

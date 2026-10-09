@@ -21,7 +21,7 @@ The implemented pipeline covers building, manifest-driven local execution, stati
 11. Validate that the output contains no symbolic links or Windows junction/reparse-point links.
 12. Derive a version-2 routing contract and inventory eligible static assets and prerendered responses.
 13. Upload static objects to an immutable R2 prefix (unless `--no-upload` is set).
-14. Publish the finalized manifest last. The server runtime stays in the local output directory and is not packaged or uploaded.
+14. Publish the finalized manifest last. The server runtime stays in the local output directory and is not uploaded. `package lambda` (below) packages it for AWS Lambda separately.
 
 The builder does **not** modify next.config.* and does **not** force output: "standalone".
 
@@ -150,6 +150,28 @@ stdout carries only protocol frames. Application output (`console.log`, `console
 - Logs are single-line JSON on stdout and never contain request headers, cookies or bodies. Events that are not Function URL events are rejected with an invocation error.
 
 The handler expects its working directory to be the package root, as on Lambda (`/var/task`): Next.js resolves `.next/` against `process.cwd()`.
+
+### Lambda package
+
+`package lambda` turns `runtime/` of a built output into an AWS Lambda deployment package (Node.js managed runtime, .zip, no containers):
+
+~~~bash
+cargo run -- package lambda .meshscale/output --arch x86_64 --node-runtime nodejs24.x
+~~~
+
+It writes `lambda.zip` and `lambda.json` to `--out` (default `<OUTPUT>/lambda`; `upload` accepts that directory and never uploads it). The handler is `lambda-entry.handler`. Checks, in order, each with its own error:
+
+1. the output validates and has a version-2 manifest;
+2. `runtime/lambda-entry.cjs`, `lambda-adapter.cjs` and `runtime.cjs` exist;
+3. the output was built on Linux, on the architecture given by `--arch` (`x86_64`, or `arm64` for an `aarch64` build), with the Node.js major of `--node-runtime` (`nodejs22.x` or `nodejs24.x`; `nodejs20.x` is deprecated). Native packages are not cross-built: build on the target architecture, on glibc Linux (Lambda's Node.js runtimes run on Amazon Linux 2023; musl/Alpine builds fetch the wrong native binaries);
+4. no path in `runtime/` is a link, contains `..` or a backslash, or is a `.env`/`.env.*` file;
+5. Next.js is 16.2.0 or later.
+
+The zip contains `runtime/` without the IPC shell `function-entry.cjs`. It is deterministic for one builder version: entries sorted bytewise, every modification time 1980-01-01 00:00:00, Unix modes `0644` for files and `0755` for directories (written as Unix entries even on Windows), deflate level 6, no extra fields, and directory entries only for empty directories. After writing, the zip is reopened and its entry names and sizes compared with `runtime/`.
+
+Above 250 MB unzipped (Lambda's limit, which includes layers) packaging fails and prints the size report; nothing is written. A zip above 50 MB is still written, with `requires_s3_upload: true`: it must be deployed from S3 rather than uploaded directly.
+
+`lambda.json` (schema version 1) records `build_id`, `commit`, `handler`, `runtime`, `architecture`, `node_major`, `zip_sha256`, `zip_bytes`, `uncompressed_bytes`, `file_count`, `builder_version`, `requires_s3_upload` and a size report: the 20 largest files, the 20 largest packages under `node_modules`, and the total size of source maps and of `.next/static`.
 
 ### Local Lambda mode
 

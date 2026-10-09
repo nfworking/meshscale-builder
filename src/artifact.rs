@@ -879,7 +879,7 @@ fn validate_output_mode(output_dir: &Path, server_only: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{Framework, PackageManager};
     use tempfile::TempDir;
@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn link_directory(target: &Path, link: &Path) -> Result<()> {
+    pub(crate) fn link_directory(target: &Path, link: &Path) -> Result<()> {
         let status =
             std::process::Command::new(std::env::var_os("COMSPEC").context("missing COMSPEC")?)
                 .args(["/c", "mklink", "/J"])
@@ -908,7 +908,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn link_directory(target: &Path, link: &Path) -> Result<()> {
+    pub(crate) fn link_directory(target: &Path, link: &Path) -> Result<()> {
         std::os::unix::fs::symlink(target, link)?;
         Ok(())
     }

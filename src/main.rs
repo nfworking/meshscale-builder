@@ -14,6 +14,7 @@ mod build;
 mod cache;
 mod cli;
 mod env;
+mod lambda;
 mod manifest;
 mod routing;
 mod runner;
@@ -43,6 +44,8 @@ enum Commands {
     Run(runner::RunArgs),
     /// Upload a previously built output to an immutable R2 deployment prefix.
     Upload(upload::UploadArgs),
+    /// Package a previously built output for a deployment target.
+    Package(lambda::PackageArgs),
 }
 
 #[derive(Args, Debug)]
@@ -176,6 +179,10 @@ fn main() {
         Commands::Upload(args) => {
             init_terminal_logging();
             upload::upload(args, cli.env_file.as_deref())
+        }
+        Commands::Package(args) => {
+            init_terminal_logging();
+            lambda::package(args)
         }
     };
 
