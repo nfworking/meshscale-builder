@@ -1,0 +1,30 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "text/plain"
+    ],
+    [
+      "cache-control",
+      "public, max-age=0, must-revalidate"
+    ],
+    [
+      "etag",
+      "\"aa45bf4bf696cd97f3bf43a49e3904b2924b3e27112382059bb9ed861a8a06cf\""
+    ],
+    [
+      "last-modified",
+      "Fri, 09 Oct 2026 00:24:47 GMT"
+    ],
+    [
+      "content-length",
+      "18"
+    ]
+  ],
+  "body": {
+    "length": 18,
+    "sha256": "aa45bf4bf696cd97f3bf43a49e3904b2924b3e27112382059bb9ed861a8a06cf",
+    "text": "hello from public\n"
+  }
+}

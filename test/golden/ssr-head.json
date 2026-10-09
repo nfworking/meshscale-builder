@@ -1,0 +1,26 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "vary",
+      "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch"
+    ],
+    [
+      "x-powered-by",
+      "Next.js"
+    ],
+    [
+      "cache-control",
+      "private, no-cache, no-store, max-age=0, must-revalidate"
+    ],
+    [
+      "content-type",
+      "text/html; charset=utf-8"
+    ]
+  ],
+  "body": {
+    "length": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "text": ""
+  }
+}

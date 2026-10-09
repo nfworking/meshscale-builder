@@ -1,0 +1,29 @@
+{
+  "status": 404,
+  "headers": [
+    [
+      "vary",
+      "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch"
+    ],
+    [
+      "x-powered-by",
+      "Next.js"
+    ],
+    [
+      "cache-control",
+      "private, no-cache, no-store, max-age=0, must-revalidate"
+    ],
+    [
+      "content-type",
+      "text/html; charset=utf-8"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 4783,
+    "sha256": "b818ac4970d31306ca03b2c28f02485140564f267982b2c1d850e1ef33a7024f"
+  }
+}

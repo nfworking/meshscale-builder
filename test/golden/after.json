@@ -1,0 +1,18 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "text/plain"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 9,
+    "sha256": "6aef76c6cb359f6ffaf9c6e9881c902b73eeba4562f186e1cd9861bb18b5c021",
+    "text": "scheduled"
+  }
+}

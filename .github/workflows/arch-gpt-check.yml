@@ -18,8 +18,13 @@ jobs:
           components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
-      - name: Node entrypoint syntax
-        run: node --check src/function_entry.cjs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Node syntax
+        run: for file in src/*.cjs test/runtime/*.cjs test/golden/*.cjs; do node --check "$file"; done
+      - name: Node runtime tests
+        run: node --test test/runtime/*.test.cjs
       - name: Compile
         run: cargo check --all-targets
       - name: Tests

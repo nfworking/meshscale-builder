@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "text/plain"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 8388608,
+    "sha256": "ad97f87076920684e2ca66fc44e5d322797dc9d64706b174e51b5d0828937043"
+  }
+}

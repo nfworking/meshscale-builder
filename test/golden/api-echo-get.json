@@ -1,0 +1,30 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "set-cookie",
+      "first=1; Path=/; HttpOnly"
+    ],
+    [
+      "set-cookie",
+      "second=2; Path=/"
+    ],
+    [
+      "content-type",
+      "application/json; charset=utf-8"
+    ],
+    [
+      "etag",
+      "\"3s9ejun4814u\""
+    ],
+    [
+      "content-length",
+      "174"
+    ]
+  ],
+  "body": {
+    "length": 174,
+    "sha256": "77ffe19f6296e21eea59c2541df8ccb046a7e284dbf5383553b98fb8540cbc5d",
+    "text": "{\"method\":\"GET\",\"url\":\"/api/echo?a=1&a=2&b=x+y\",\"query\":{\"a\":[\"1\",\"2\"],\"b\":\"x y\"},\"headers\":{\"cookie\":null,\"x-test\":\"get\",\"x-multi\":\"one, two\",\"content-type\":null},\"body\":\"\"}"
+  }
+}

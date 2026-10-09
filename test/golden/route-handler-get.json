@@ -1,0 +1,18 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 30,
+    "sha256": "e2efb7bd7b0e3d51a412278d032d8afcab0645ef51b024ded2f28b8524e23b72",
+    "text": "{\"method\":\"GET\",\"a\":[\"1\",\"2\"]}"
+  }
+}

@@ -1,4 +1,6 @@
 /target
+/test/fixtures/next-app/node_modules
+/test/fixtures/next-app/.next
 .env
 .env.*
 !.env.example

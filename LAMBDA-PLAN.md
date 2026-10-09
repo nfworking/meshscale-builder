@@ -87,6 +87,12 @@ These exist today. Items marked "plan" are fixed by the phase named. The rest ar
 | K8 | `DEPLOYMENT-CONTRACT.md` says Next majors 14-16 are understood, but the build requires the adapter hook (`NEXT_ADAPTER_PATH`) and fails if `meshscale-adapter.json` is missing. **[VERIFY]** which Next versions support that hook. The effective minimum is probably higher than 14. | `artifact.rs::create_output` bails without the adapter metadata | Phase 4: find the real minimum, record it, fail early with a clear message if the installed Next is older. |
 | K9 | CI (`.github/workflows/arch-gpt-check.yml`) only runs on pushes to `arch/gpt` and only syntax-checks `src/function_entry.cjs`. | workflow file | Phase 1: check every `.cjs`, run the Node tests; ask the owner about triggers. |
 | K10 | Request header `transfer-encoding: chunked` is passed through to the worker even though the runner buffers the body. | `runner.rs::invoke` copies all headers | Record. The Lambda path drops it (the shim and adapter both do). |
+| K12 | Found in Phase 1 (fixture, Next 16.4.0). The runtime's response object has no `appendHeader`. Next calls it for prerendered App Router pages, so `/` returns 500 (`r.appendHeader is not a function`) when it reaches the function. | `test/golden/static-home.json` | Record. Small fix (add `appendHeader`) when the owner approves; it changes golden `static-home`. |
+| K13 | Found in Phase 1. The fixture's `/` is not served statically: `fallback_reasons` contains `/:missing-html`, so `static_output.rs` does not find Next 16.4's prerender HTML where it looks. The matrix row "static page `/` never reaches Lambda" does not hold today. | fixture `manifest.json` | Record; investigate the prerender output location for Next 16.4. |
+| K14 | Found in Phase 1. App Router `headers().get('host')` is `null` through the function runtime even though `req.headers.host` is set, and the Server Action POST fails Next's origin check (`x-forwarded-host` or `host` "not provided") with 500. Relevant to the Lambda `x-forwarded-host` design (6.2). | `test/golden/ssr.json`, `action-submit.json` | Record. Understand how Next 16.4's adapter handler reads the host before Phase 2. |
+| K15 | Found in Phase 1. Next writes `runtime/.next/server/route-cache/...` while serving prerendered pages. Lambda's code directory is read-only, so this will fail there, and locally it mutates the artifact (goldens must run on a fresh copy). | file timestamps after a golden run | Must be resolved before Phase 4/5 (cache handler or cache dir under `/tmp`). |
+| K16 | README describes opt-in npm/pnpm integration tests that install and publish real apps; none exist in the code (`upload.rs::publish_real_fixture` is an unused leftover). | `README.md` "Validation", clippy dead-code list | Record. Phase 1 adds `build::tests::builds_fixture_app` (ignored) for the fixture. |
+| K17 | Baseline on Windows before Phase 0: `cargo fmt --check` fails (build.rs, main.rs, manifest.rs), `cargo clippy -D warnings` fails (unused code in cache.rs/stats.rs/runner.rs plus two runner.rs lints), and two tests fail (`adapter_routing_uses_detected_package_manager` expects `npm` but gets `npm.cmd`; `formats_durations` expects `1m 5s` but gets `1m 5.0s`). | Phase 0 baseline run | Record; not fixed (not listed in the plan). |
 | K11 | Child processes inherit the builder's full environment, minus a denylist (`remove_credentials`). The denylist covers `MESHSCALE_GITHUB_TOKEN` and the R2 names only. Anything else in the environment (`AWS_*`, cloud tokens) reaches customer install scripts. There is also no way to pass project build-time variables (for example `NEXT_PUBLIC_*`) except by putting them in the builder's own environment. | `build.rs::run_command`, `run_build`; `upload.rs::remove_credentials` | Phase 0. |
 
 ## 4. Design decisions
@@ -215,6 +221,11 @@ Fix K4 in the shared request builder (`cookie` joins with `"; "`). Implement K5 
   cannot resolve it, only warns, and silently drops `@next/routing`'s dependency tree from the artifact.
 - Update the fake NFT module in `artifact.rs` tests: it returns only its first argument today
   (`async ([file]) => ...`); make it return all arguments.
+- Note (Phase 1 implementation): `lambda-adapter.cjs` and `lambda-entry.cjs` do not exist until Phase 2, so
+  Phase 1 generates and stages `runtime.cjs` and `function-entry.cjs` from a table
+  (`GENERATED_RUNTIME_FILES`, `GENERATED_ENTRYPOINTS` in `artifact.rs`); Phase 2 adds its two files to it.
+  Only unresolved *relative* imports from staged files are fatal: the pre-refactor entry already produced an
+  NFT warning for the dynamic `import()` in `loadHandler`, which must stay a warning.
 - Add a test asserting the generated `runtime/` contains the four files and that a deliberately
   broken relative require in a staged file makes the build fail loudly (treat an unresolvable relative
   import from our own files as an error, not a warning).

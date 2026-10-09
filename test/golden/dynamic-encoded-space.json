@@ -1,0 +1,35 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "vary",
+      "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch"
+    ],
+    [
+      "x-powered-by",
+      "Next.js"
+    ],
+    [
+      "cache-control",
+      "private, no-cache, no-store, max-age=0, must-revalidate"
+    ],
+    [
+      "content-type",
+      "text/html; charset=utf-8"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 5407,
+    "sha256": "e1184e3bbf0c97bc62efa5e2660d76beb51a8afa527700871653dc0742f56e25",
+    "marked": [
+      [
+        "param",
+        "&quot;a%20b&quot;"
+      ]
+    ]
+  }
+}

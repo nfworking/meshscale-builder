@@ -3,7 +3,6 @@ use serde_json::json;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -11,6 +10,16 @@ use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::BuildMetadata;
+
+/// Runtime files generated into `runtime/` (artifact name, source). Source files use
+/// underscores, artifact names hyphens. `function-entry.cjs` is the IPC entrypoint named by
+/// the manifest and must keep that name.
+const GENERATED_RUNTIME_FILES: [(&str, &str); 2] = [
+    ("runtime.cjs", include_str!("runtime.cjs")),
+    ("function-entry.cjs", include_str!("function_entry.cjs")),
+];
+/// Generated files that are entrypoints. Their dependency trees are traced together.
+const GENERATED_ENTRYPOINTS: [&str; 1] = ["function-entry.cjs"];
 
 pub fn create_output(
     project_dir: &Path,
@@ -66,10 +75,13 @@ pub fn create_output(
         .with_context(|| format!("failed to create {}", static_dir.display()))?;
 
     let mut all_traced_files = collect_next_trace_files(&next_dir, &project_root)?;
-    if all_traced_files.contains_key("function-entry.cjs") {
-        bail!("project trace conflicts with the generated function-entry.cjs entrypoint");
-    }
-    collect_entrypoint_trace(project_dir, &project_root, &mut all_traced_files)?;
+    collect_entrypoint_trace(
+        project_dir,
+        &project_root,
+        &mut all_traced_files,
+        &GENERATED_RUNTIME_FILES,
+        &GENERATED_ENTRYPOINTS,
+    )?;
     if metadata.version == 2 {
         collect_adapter_assets(
             project_dir,
@@ -83,6 +95,11 @@ pub fn create_output(
         ensure_runtime_package_manifest(&project_root, &mut all_traced_files, "@next/routing")?;
     }
     materialize_package_dependencies(&project_root, &mut all_traced_files)?;
+    for (name, _) in GENERATED_RUNTIME_FILES {
+        if all_traced_files.contains_key(name) {
+            bail!("project trace conflicts with the generated runtime file {name}");
+        }
+    }
 
     info!(files = all_traced_files.len(), "collected runtime trace");
 
@@ -101,11 +118,10 @@ pub fn create_output(
     }
     copy_public_assets(project_dir, &static_dir)?;
     copy_next_static(project_dir, &static_dir)?;
-    fs::write(
-        runtime_dir.join("function-entry.cjs"),
-        include_str!("function_entry.cjs"),
-    )
-    .context("failed to write MeshScale function entrypoint")?;
+    for (name, source) in GENERATED_RUNTIME_FILES {
+        fs::write(runtime_dir.join(name), source)
+            .with_context(|| format!("failed to write generated runtime file {name}"))?;
+    }
 
     let manifest = json!({
         "version": metadata.version,
@@ -233,22 +249,34 @@ fn collect_next_trace_files(
     Ok(files)
 }
 
+/// Traces the generated entrypoints with Next's bundled NFT. The generated files are staged
+/// together in a directory inside the project, so relative requires between them resolve
+/// and Node resolution can walk up to the project's `node_modules`. Staged files are not
+/// collected (they are written separately).
 fn collect_entrypoint_trace(
     project_dir: &Path,
     project_root: &Path,
     files: &mut BTreeMap<String, PathBuf>,
+    generated: &[(&str, &str)],
+    entrypoints: &[&str],
 ) -> Result<()> {
-    let mut entrypoint = tempfile::Builder::new()
-        .prefix(".meshscale-function-entrypoint-")
-        .suffix(".cjs")
-        .tempfile_in(project_dir)
-        .context("failed to stage production entrypoint for tracing")?;
-    entrypoint.write_all(include_bytes!("function_entry.cjs"))?;
-    entrypoint.flush()?;
-    let entrypoint_source = entrypoint.path().canonicalize()?;
+    let staging = tempfile::Builder::new()
+        .prefix(".meshscale-runtime-")
+        .tempdir_in(project_dir)
+        .context("failed to stage generated runtime files for tracing")?;
+    for (name, source) in generated {
+        fs::write(staging.path().join(name), source)
+            .with_context(|| format!("failed to stage generated runtime file {name}"))?;
+    }
+    let staging_name = staging
+        .path()
+        .file_name()
+        .context("runtime staging directory has no name")?
+        .to_owned();
+    let staging_root = staging.path().canonicalize()?;
     let script = r#"
 const { nodeFileTrace } = require('next/dist/compiled/@vercel/nft');
-nodeFileTrace([process.argv[1]], {
+nodeFileTrace(process.argv.slice(1), {
   base: process.cwd(),
   processCwd: process.cwd(),
 }).then(({ fileList, warnings }) => {
@@ -257,14 +285,11 @@ nodeFileTrace([process.argv[1]], {
 "#;
     let mut command = Command::new("node");
     crate::env::restrict_build_env(&mut command, &[]);
+    command.args(["-e", script]);
+    for entrypoint in entrypoints {
+        command.arg(Path::new(&staging_name).join(entrypoint));
+    }
     let output = command
-        .args(["-e", script])
-        .arg(
-            entrypoint
-                .path()
-                .file_name()
-                .context("staged entrypoint has no filename")?,
-        )
         .current_dir(project_dir)
         .env("NODE_ENV", "production")
         .output()
@@ -282,19 +307,40 @@ nodeFileTrace([process.argv[1]], {
     }
     let trace: Trace = serde_json::from_slice(&output.stdout)
         .context("invalid production entrypoint NFT trace")?;
-    for warning in trace.warnings {
+    for warning in &trace.warnings {
+        // A missing relative import between our own files would silently drop the
+        // dependency tree behind it (for example @next/routing), so it is fatal.
+        if let Some(specifier) = unresolved_staged_import(warning, &staging_name) {
+            bail!(
+                "generated runtime file imports {specifier}, which cannot be resolved; NFT reported: {warning}"
+            );
+        }
         warn!(warning, "production entrypoint NFT warning");
     }
     for relative in trace.files {
         let (logical, source) = resolve_trace_file(project_root, project_dir, &relative)?;
-        if source != entrypoint_source {
+        if !source.starts_with(&staging_root) {
             collect_trace_entry(files, project_root, &logical, &source)?;
         }
     }
-    entrypoint
+    staging
         .close()
-        .context("failed to remove staged production entrypoint")?;
+        .context("failed to remove staged runtime files")?;
     Ok(())
+}
+
+/// Returns the specifier when an NFT warning reports a relative import that could not be
+/// resolved from a file in the staging directory. NFT formats these as
+/// `Failed to resolve dependency "<specifier>":\nCannot find module '...' loaded from <file>`.
+fn unresolved_staged_import(warning: &str, staging_name: &std::ffi::OsStr) -> Option<String> {
+    let rest = warning.split_once("Failed to resolve dependency \"")?.1;
+    let (specifier, rest) = rest.split_once('"')?;
+    let (_, loaded_from) = rest.rsplit_once(" loaded from ")?;
+    let relative = specifier.starts_with("./") || specifier.starts_with("../");
+    let staged = Path::new(loaded_from.trim())
+        .components()
+        .any(|component| component.as_os_str() == staging_name);
+    (relative && staged).then(|| specifier.to_owned())
 }
 
 fn collect_trace_entry(
@@ -865,6 +911,42 @@ mod tests {
         Ok(())
     }
 
+    /// Stands in for Next's bundled NFT: follows relative requires from every input file and
+    /// reports a missing one in the same format as the real NFT (checked against Next 16.4).
+    const FAKE_NFT: &str = r#"
+const fs = require('fs');
+const path = require('path');
+exports.nodeFileTrace = async (files) => {
+  const fileList = new Set(['node_modules/next/package.json']);
+  const warnings = new Set();
+  const visit = (file) => {
+    if (fileList.has(file)) return;
+    fileList.add(file);
+    for (const [, specifier] of fs.readFileSync(file, 'utf8').matchAll(/require\('(\.{1,2}\/[^']+)'\)/g)) {
+      const target = path.join(path.dirname(file), specifier);
+      if (fs.existsSync(target)) visit(target);
+      else warnings.add(new Error(`Failed to resolve dependency "${specifier}":\nCannot find module '${path.resolve(target)}' loaded from ${path.resolve(file)}`));
+    }
+  };
+  files.forEach(visit);
+  return { fileList, warnings };
+};
+"#;
+
+    fn write_fake_nft(project: &Path) -> Result<()> {
+        write_file(
+            &project
+                .join("node_modules")
+                .join("next")
+                .join("dist")
+                .join("compiled")
+                .join("@vercel")
+                .join("nft")
+                .join("index.js"),
+            FAKE_NFT,
+        )
+    }
+
     fn write_trace(project: &Path, files: &[&str]) -> Result<()> {
         write_file(
             &project.join(".next").join("next-server.js.nft.json"),
@@ -897,7 +979,7 @@ mod tests {
                 .join("@vercel")
                 .join("nft")
                 .join("index.js"),
-            "exports.nodeFileTrace = async ([file]) => ({fileList: new Set([file, 'node_modules/next/package.json']), warnings: new Set()});",
+            FAKE_NFT,
         )?;
         write_file(&env.join("package.json"), r#"{"name":"@next/env"}"#)?;
         write_file(&env.join("dist").join("index.js"), "env module")?;
@@ -989,6 +1071,18 @@ mod tests {
             "static"
         );
 
+        for (name, source) in GENERATED_RUNTIME_FILES {
+            assert_eq!(fs::read_to_string(runtime.join(name))?, source, "{name}");
+        }
+        assert!(
+            fs::read_dir(&project)?.all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".meshscale-runtime-")),
+            "runtime staging directory was not removed"
+        );
+
         fs::remove_dir_all(&project)?;
         validate_output(&output)?;
         assert_eq!(
@@ -1006,6 +1100,105 @@ mod tests {
             "env module"
         );
         Ok(())
+    }
+
+    #[test]
+    fn traces_all_generated_entrypoints_and_skips_staged_files() -> Result<()> {
+        let workspace = TempDir::new()?;
+        let project = workspace.path().join("repo");
+        write_fake_nft(&project)?;
+        write_file(
+            &project
+                .join("node_modules")
+                .join("next")
+                .join("package.json"),
+            "{}",
+        )?;
+        let root = project.canonicalize()?;
+        let mut files = BTreeMap::new();
+        collect_entrypoint_trace(
+            &project,
+            &root,
+            &mut files,
+            &[
+                ("shared.cjs", "require('./nested.cjs');"),
+                ("nested.cjs", "'use strict';"),
+                ("first.cjs", "require('./shared.cjs');"),
+                ("second.cjs", "require('./shared.cjs');"),
+            ],
+            &["first.cjs", "second.cjs"],
+        )?;
+        // Only project files are collected; staged files are written separately.
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            vec!["node_modules/next/package.json"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolvable_relative_import_in_generated_files_fails_the_build() -> Result<()> {
+        let workspace = TempDir::new()?;
+        let project = workspace.path().join("repo");
+        write_fake_nft(&project)?;
+        let root = project.canonicalize()?;
+        let error = collect_entrypoint_trace(
+            &project,
+            &root,
+            &mut BTreeMap::new(),
+            &[
+                ("runtime.cjs", "'use strict';"),
+                (
+                    "function-entry.cjs",
+                    "require('./runtime.cjs'); require('./missing-runtime.cjs');",
+                ),
+            ],
+            &["function-entry.cjs"],
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("./missing-runtime.cjs"), "{message}");
+        assert!(message.contains("cannot be resolved"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_relative_imports_from_staged_files_are_fatal() {
+        let staging = std::ffi::OsStr::new(".meshscale-runtime-abc123");
+        let staged = r"C:\work\repo\.meshscale-runtime-abc123\function-entry.cjs";
+        let warning = |specifier: &str, from: &str| {
+            format!(
+                "Error: Failed to resolve dependency \"{specifier}\":\nCannot find module 'C:\\work\\x' loaded from {from}"
+            )
+        };
+        assert_eq!(
+            unresolved_staged_import(&warning("./runtime.cjs", staged), staging).as_deref(),
+            Some("./runtime.cjs")
+        );
+        assert_eq!(
+            unresolved_staged_import(
+                &warning(
+                    "../x.cjs",
+                    "/work/repo/.meshscale-runtime-abc123/runtime.cjs"
+                ),
+                staging
+            )
+            .as_deref(),
+            Some("../x.cjs")
+        );
+        // The existing dynamic import() warning, package imports and project files are not fatal.
+        assert!(
+            unresolved_staged_import(&warning("C:\\work\\repo\\\u{1a}", staged), staging).is_none()
+        );
+        assert!(unresolved_staged_import(&warning("optional-peer", staged), staging).is_none());
+        assert!(
+            unresolved_staged_import(
+                &warning("./missing.cjs", r"C:\work\repo\node_modules\x\index.js"),
+                staging
+            )
+            .is_none()
+        );
+        assert!(unresolved_staged_import("unrelated warning", staging).is_none());
     }
 
     #[test]

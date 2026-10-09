@@ -1,39 +1,24 @@
 'use strict';
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { AsyncLocalStorage } = require('node:async_hooks');
-const { Readable, Writable } = require('node:stream');
-const { pathToFileURL } = require('node:url');
+// MeshScale IPC shell: speaks the runner's framed stdin/stdout protocol and hands each
+// request to runtime.cjs. Next.js execution lives in runtime.cjs.
 
-// Next.js server modules expect AsyncLocalStorage to be exposed on the global
-// object by the Next runtime. MeshScale invokes adapter output modules directly
-// from its own Node worker, so provide the same runtime primitive before any
-// Next.js modules are loaded.
-if (!globalThis.AsyncLocalStorage) {
-  globalThis.AsyncLocalStorage = AsyncLocalStorage;
-}
+// stdout is the frame channel. Application code (console.log, libraries) must never
+// write to it, or the runner's frame parser breaks. Keep the raw writer for frames and
+// send everything else to stderr.
+const rawStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, encoding, callback) =>
+  process.stderr.write(chunk, encoding, callback);
+console.log = console.error;
+console.info = console.error;
+console.debug = console.error;
 
-const { resolveRoutes } = require('@next/routing');
-
-process.env.NODE_ENV = 'production';
-
-const root = __dirname;
-const adapterPath = path.join(root, '.next', 'meshscale-adapter.json');
-const metadata = JSON.parse(fs.readFileSync(adapterPath, 'utf8'));
-
-const outputs = [
-  ...(metadata.outputs.pages || []),
-  ...(metadata.outputs.pagesApi || []),
-  ...(metadata.outputs.appPages || []),
-  ...(metadata.outputs.appRoutes || []),
-];
-const pathnames = outputs.map((output) => output.pathname);
-const handlers = new Map();
+const { createRuntime } = require('./runtime.cjs');
 
 const MAX_FRAME = 64 * 1024 * 1024;
 let input = Buffer.alloc(0);
 let stdoutTail = Promise.resolve();
+let runtime;
 
 function writeFrame(header, body = Buffer.alloc(0)) {
   if (body.length !== (header.length || 0)) {
@@ -51,14 +36,10 @@ function writeFrame(header, body = Buffer.alloc(0)) {
   body.copy(frame, 8 + json.length);
 
   const job = stdoutTail.then(() => new Promise((resolve, reject) => {
-    process.stdout.write(frame, (error) => error ? reject(error) : resolve());
+    rawStdoutWrite(frame, (error) => error ? reject(error) : resolve());
   }));
   stdoutTail = job.catch(() => {});
   return job;
-}
-
-function queueFrame(header, body = Buffer.alloc(0)) {
-  return writeFrame(header, body);
 }
 
 async function consumeStdin() {
@@ -83,265 +64,43 @@ async function consumeStdin() {
   }
 }
 
-async function loadHandler(output) {
-  const key = output.id;
-  if (handlers.has(key)) return handlers.get(key);
-
-  const modulePath = path.resolve(root, output.filePath);
-  let loaded;
-  try {
-    loaded = require(modulePath);
-  } catch (error) {
-    if (error && error.code === 'ERR_REQUIRE_ESM') {
-      loaded = await import(pathToFileURL(modulePath).href);
-    } else {
-      throw error;
-    }
-  }
-
-  const handler = loaded.handler || loaded.default || loaded;
-  if (typeof handler !== 'function') {
-    throw new Error('adapter output ' + output.id + ' does not export a handler');
-  }
-  handlers.set(key, handler);
-  return handler;
-}
-
-function findOutput(pathname, requestUrl) {
-  const rsc = requestUrl.headers.rsc || requestUrl.headers['next-router-prefetch'];
-  const candidates = outputs.filter((output) => output.pathname === pathname);
-  if (candidates.length === 1) return candidates[0];
-  if (!rsc) {
-    const normal = candidates.find((output) => !output.pathname.endsWith('.rsc'));
-    if (normal) return normal;
-  }
-  return candidates[0];
-}
-
-function makeRequest(header, body) {
-  const headers = {};
-  const rawHeaders = [];
-
-  for (const [name, value] of header.headers || []) {
-    const lower = name.toLowerCase();
-    if (lower === 'set-cookie') {
-      headers[lower] = Array.isArray(headers[lower]) ? [...headers[lower], value] : [value];
-    } else if (headers[lower] === undefined) {
-      headers[lower] = value;
-    } else if (Array.isArray(headers[lower])) {
-      headers[lower].push(value);
-    } else {
-      headers[lower] = headers[lower] + ', ' + value;
-    }
-    rawHeaders.push(name, value);
-  }
-
-  const req = Readable.from(body.length ? [body] : []);
-  req.method = header.method || 'GET';
-  req.url = header.uri || '/';
-  req.headers = headers;
-  req.rawHeaders = rawHeaders;
-  req.httpVersion = '1.1';
-  req.httpVersionMajor = 1;
-  req.httpVersionMinor = 1;
-  req.complete = true;
-  req.aborted = false;
-  req.socket = {
-    encrypted: false,
-    remoteAddress: '127.0.0.1',
-    remotePort: 0,
-    localAddress: '127.0.0.1',
-    localPort: 0,
-  };
-  req.connection = req.socket;
-  return req;
-}
-
-class FunctionResponse extends Writable {
-  constructor(id) {
-    super();
-    this.id = id;
-    this.statusCode = 200;
-    this.statusMessage = undefined;
-    this.headers = new Map();
-    this.headersSent = false;
-    this._completion = new Promise((resolve, reject) => {
-      this._resolveCompletion = resolve;
-      this._rejectCompletion = reject;
-    });
-    this.once('finish', () => {
-      this._resolveCompletion();
-    });
-    this.once('error', (error) => this._rejectCompletion(error));
-  }
-
-  setHeader(name, value) {
-    if (this.headersSent) throw new Error('headers already sent');
-    this.headers.set(String(name).toLowerCase(), value);
-    return this;
-  }
-
-  getHeader(name) {
-    return this.headers.get(String(name).toLowerCase());
-  }
-
-  getHeaders() {
-    return Object.fromEntries(this.headers);
-  }
-
-  getHeaderNames() {
-    return [...this.headers.keys()];
-  }
-
-  hasHeader(name) {
-    return this.headers.has(String(name).toLowerCase());
-  }
-
-  removeHeader(name) {
-    if (this.headersSent) throw new Error('headers already sent');
-    this.headers.delete(String(name).toLowerCase());
-  }
-
-  writeHead(statusCode, reasonOrHeaders, maybeHeaders) {
-    if (typeof reasonOrHeaders === 'object' && reasonOrHeaders !== null) {
-      Object.entries(reasonOrHeaders).forEach(([name, value]) => this.setHeader(name, value));
-    } else if (maybeHeaders) {
-      Object.entries(maybeHeaders).forEach(([name, value]) => this.setHeader(name, value));
-    }
-    this.statusCode = statusCode;
-    this._sendHeaders();
-    return this;
-  }
-
-  flushHeaders() {
-    this._sendHeaders();
-  }
-
-  _sendHeaders() {
-    if (this.headersSent) return;
-    this.headersSent = true;
-
-    const headers = [];
-    for (const [name, value] of this.headers) {
-      if (Array.isArray(value)) {
-        for (const item of value) headers.push([name, String(item)]);
-      } else {
-        headers.push([name, String(value)]);
-      }
-    }
-
-    queueFrame({
-      kind: 'headers',
-      id: this.id,
-      status: this.statusCode,
-      headers,
-      length: 0,
-    }).catch((error) => this.destroy(error));
-  }
-
-  _write(chunk, encoding, callback) {
-    try {
-      this._sendHeaders();
-      queueFrame({
-        kind: 'chunk',
-        id: this.id,
-        length: Buffer.byteLength(chunk),
-      }, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding))
-        .then(() => callback(), callback);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  _final(callback) {
-    this._sendHeaders();
-    queueFrame({
-      kind: 'end',
-      id: this.id,
-      length: 0,
-    }).then(() => callback(), callback);
-  }
-
-  completion() {
-    return this._completion;
-  }
-}
-
 async function handleRequest(header, body) {
-  const req = makeRequest(header, body);
-  const res = new FunctionResponse(header.id);
-
+  const response = await runtime.invoke({
+    method: header.method || 'GET',
+    url: header.uri || '/',
+    headers: header.headers || [],
+    body,
+  });
+  const chunks = response.body[Symbol.asyncIterator]();
+  let complete = false;
   try {
-    const requestUrl = new URL(
-      req.url || '/',
-      'http://' + (req.headers.host || '127.0.0.1'),
-    );
-
-    const result = await resolveRoutes({
-      url: requestUrl,
-      buildId: metadata.buildId,
-      basePath: metadata.config.basePath || '',
-      i18n: metadata.config.i18n || undefined,
-      headers: new Headers(req.headers),
-      requestBody: req,
-      pathnames,
-      routes: metadata.routing,
-      invokeMiddleware: async () => ({}),
+    await writeFrame({
+      kind: 'headers',
+      id: header.id,
+      status: response.status,
+      headers: response.headers,
+      length: 0,
     });
-
-    if (result.redirect) {
-      res.statusCode = result.redirect.status;
-      res.setHeader('location', result.redirect.url.toString());
-      res.end();
-      await res.completion();
-      return;
+    for (;;) {
+      const { value, done } = await chunks.next();
+      if (done) break;
+      await writeFrame({ kind: 'chunk', id: header.id, length: value.length }, value);
     }
-
-    if (!result.resolvedPathname) {
-      res.statusCode = 404;
-      res.end('Not Found');
-      await res.completion();
-      return;
-    }
-
-    const output = findOutput(result.resolvedPathname, req);
-    if (!output) {
-      res.statusCode = 404;
-      res.end('Not Found');
-      await res.completion();
-      return;
-    }
-
-    const handler = await loadHandler(output);
-    await handler(req, res, {
-      waitUntil: (promise) => {
-        Promise.resolve(promise).catch((error) => {
-          console.error('MeshScale waitUntil task failed:', error);
-        });
-      },
-      requestMeta: {
-        relativeProjectDir: '.',
-        hostname: req.headers.host || '127.0.0.1',
-      },
-    });
-
-    if (!res.writableEnded) res.end();
-    await res.completion();
+    complete = true;
+    await response.done;
   } catch (error) {
-    console.error('MeshScale function invocation failed:', error);
-    try {
-      if (!res.headersSent) res.statusCode = 500;
-      if (!res.writableEnded) res.end('Internal Server Error');
-      await res.completion();
-    } catch {
-      await queueFrame({
-        kind: 'error',
-        id: header.id,
-        error: String(error && error.message ? error.message : error),
-        length: 0,
-      }).catch(() => {});
-    }
+    console.error('MeshScale function response failed:', error);
+    await writeFrame({
+      kind: 'error',
+      id: header.id,
+      error: String(error && error.message ? error.message : error),
+      length: 0,
+    }).catch(() => {});
+    return;
+  } finally {
+    if (!complete) await chunks.return();
   }
+  await writeFrame({ kind: 'end', id: header.id, length: 0 });
 }
 
 async function dispatchFrame(header, body) {
@@ -349,19 +108,27 @@ async function dispatchFrame(header, body) {
     if (body.length !== header.length) throw new Error('function request body length mismatch');
     void handleRequest(header, body).catch((error) => {
       console.error('MeshScale function request failed:', error);
-      queueFrame({ kind: 'error', id: header.id, error: String(error), length: 0 }).catch(() => {});
+      writeFrame({ kind: 'error', id: header.id, error: String(error), length: 0 }).catch(() => {});
     });
     return;
   }
   throw new Error('unknown function protocol frame');
 }
 
-writeFrame({ kind: 'ready', length: 0 }).catch((error) => {
-  console.error('MeshScale function runtime failed to signal readiness:', error);
-  process.exitCode = 1;
-});
-
-consumeStdin().catch((error) => {
-  console.error('MeshScale function runtime protocol failed:', error);
-  process.exitCode = 1;
-});
+createRuntime({ root: __dirname }).then(
+  (created) => {
+    runtime = created;
+    writeFrame({ kind: 'ready', length: 0 }).catch((error) => {
+      console.error('MeshScale function runtime failed to signal readiness:', error);
+      process.exitCode = 1;
+    });
+    consumeStdin().catch((error) => {
+      console.error('MeshScale function runtime protocol failed:', error);
+      process.exitCode = 1;
+    });
+  },
+  (error) => {
+    console.error('MeshScale function runtime failed to start:', error);
+    process.exitCode = 1;
+  },
+);

@@ -1,0 +1,18 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "transfer-encoding",
+      "chunked"
+    ]
+  ],
+  "body": {
+    "length": 17,
+    "sha256": "21b82da98d7f0f76e68ce3bd69eadbe4b7fdca06ef5fe10f0ce595acca810262",
+    "text": "{\"marker\":\"done\"}"
+  }
+}

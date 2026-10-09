@@ -611,6 +611,61 @@ mod tests {
         );
     }
 
+    /// Builds `test/fixtures/next-app` through the real pipeline (install, adapter routing
+    /// install, adapter build, artifact creation) without cloning from GitHub. The output goes
+    /// to `$MESHSCALE_FIXTURE_OUTPUT` or `target/meshscale-fixture/output`, where
+    /// `test/golden/golden.cjs` and `run` can use it. Needs npm, Node and network access:
+    /// `cargo test builds_fixture_app -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs npm, Node and network access"]
+    fn builds_fixture_app() -> anyhow::Result<()> {
+        use std::path::{Path, PathBuf};
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter("meshscale_builder=info")
+            .try_init();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = root.join("test").join("fixtures").join("next-app");
+        let workspace = tempfile::TempDir::new()?;
+        let project = workspace.path().join("next-app");
+        for entry in walkdir::WalkDir::new(&fixture)
+            .into_iter()
+            .filter_entry(|entry| {
+                !matches!(entry.file_name().to_str(), Some("node_modules" | ".next"))
+            })
+        {
+            let entry = entry?;
+            let destination = project.join(entry.path().strip_prefix(&fixture)?);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&destination)?;
+            } else {
+                std::fs::copy(entry.path(), &destination)?;
+            }
+        }
+        let package_json = super::load_package_json(&project.join("package.json"))?;
+        let package_manager = super::detect_package_manager(&project, &package_json)?;
+        super::install_dependencies(&project, package_manager, &[])?;
+        super::install_adapter_runtime_dependency(&project, package_manager, &[])?;
+        super::run_build(&project, package_manager, &package_json, &[])?;
+        let metadata = crate::BuildMetadata {
+            version: 2,
+            framework: crate::Framework::NextJs,
+            package_manager,
+            build_id: "fixture_build".to_owned(),
+            repository: "meshscale/fixture".to_owned(),
+            commit: "1234567890abcdef1234567890abcdef12345678".to_owned(),
+            branch: "main".to_owned(),
+            org_id: None,
+            project_id: None,
+        };
+        let output = std::env::var_os("MESHSCALE_FIXTURE_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target").join("meshscale-fixture").join("output"));
+        let output = super::create_output(&project, &metadata, &output)?;
+        println!("fixture output: {}", output.display());
+        Ok(())
+    }
+
     #[test]
     fn adapter_routing_rejects_invalid_versions() {
         assert!(adapter_routing_spec("16").is_err());

@@ -1,0 +1,30 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "set-cookie",
+      "first=1; Path=/; HttpOnly"
+    ],
+    [
+      "set-cookie",
+      "second=2; Path=/"
+    ],
+    [
+      "content-type",
+      "application/json; charset=utf-8"
+    ],
+    [
+      "etag",
+      "\"cvfy438t14s\""
+    ],
+    [
+      "content-length",
+      "172"
+    ]
+  ],
+  "body": {
+    "length": 172,
+    "sha256": "8997f57fbe366ac99d20621256aa05e3998ce6418dc18e1671ad4e0f3f25f8c0",
+    "text": "{\"method\":\"POST\",\"url\":\"/api/echo\",\"query\":{},\"headers\":{\"cookie\":\"c=3, d=4\",\"x-test\":null,\"x-multi\":null,\"content-type\":\"application/json\"},\"body\":{\"hello\":\"world\",\"n\":1}}"
+  }
+}
