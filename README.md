@@ -151,6 +151,36 @@ stdout carries only protocol frames. Application output (`console.log`, `console
 
 The handler expects its working directory to be the package root, as on Lambda (`/var/task`): Next.js resolves `.next/` against `process.cwd()`.
 
+### Local Lambda mode
+
+`run --lambda-local` sends dynamic requests through the artifact's `runtime/lambda-entry.cjs` instead of `function-entry.cjs`, without AWS:
+
+~~~bash
+cargo run -- run .meshscale/output --lambda-local
+~~~
+
+The Rust runner still plays the edge (host routing, routing rules, static files). Its worker is a development-only shim embedded in the builder binary (`src/lambda_local_host.cjs`, staged to a temporary file and never part of an artifact). It turns each request into a Function URL event (payload format 2.0), calls `handler(event, context)` and turns the result back into a response:
+
+- the browser's host goes in `x-forwarded-host`; `host` is a fake `*.lambda-url.<region>.on.aws` domain; cookies move to `event.cookies`; duplicate headers are comma-joined;
+- text request bodies stay strings, others are base64;
+- invocations run one at a time, like one Lambda execution environment (`MESHSCALE_LAMBDA_LOCAL_CONCURRENCY` changes this), with a 30 second timeout (`MESHSCALE_LAMBDA_LOCAL_TIMEOUT_MS`);
+- requests and responses above the Lambda payload limit return `413` and `502`, and a malformed handler result is a `502`; these shim errors carry `x-meshscale-lambda-local-error`;
+- Lambda-style environment variables (`AWS_LAMBDA_FUNCTION_NAME`, `AWS_REGION`, `LAMBDA_TASK_ROOT`, ...) are set when unset, never credentials. The app's runtime environment is the runner's environment: `MESHSCALE_TEST_VALUE=x cargo run -- run .meshscale/output --lambda-local`.
+
+`--idle-timeout-secs 5` stops the worker after 5 idle seconds, so the next request starts a fresh Node process: a local stand-in for a cold start (see the `[lambda-local] handler module loaded in N ms` line on stderr). The artifact must contain `runtime/lambda-entry.cjs`; rebuild older artifacts. If the runner is killed forcibly (not Ctrl+C), the staged shim file stays in the temporary directory.
+
+Local mode is necessary but not sufficient. It does not emulate:
+
+| Not emulated | Consequence |
+|---|---|
+| Freeze/thaw between invocations | `waitUntil`/`after()` bugs are invisible. The adapter unit tests assert completion before return; check on real Lambda too. |
+| Read-only code directory, `/tmp` semantics | Next writes `runtime/.next/server/route-cache` while serving, which fails on Lambda. Use the Lambda Runtime Interface Emulator or real Lambda. |
+| Memory and CPU limits, cold-start timing | Measure on real Lambda only. |
+| IAM auth, Function URL error pages | Real error statuses and bodies differ from the shim's 502/413. |
+| The exact base64 decision AWS makes for request bodies | Handlers accept both forms. |
+| Response streaming | Responses are buffered. |
+| Real header normalization by Lambda | Compare against events captured from a real Function URL. |
+
 Multiple deployments can share one local edge process:
 
 ~~~bash
@@ -287,7 +317,7 @@ cargo run -- run target/meshscale-fixture/output --port 3100
 node test/golden/golden.cjs --base http://127.0.0.1:3100 --compare
 ~~~
 
-Next writes caches into `runtime/.next/server/route-cache` while serving, so compare against a fresh copy of the output. The intentional differences from the recorded files are `ssr` and `api-echo-post-json` (cookie join) and `log`/`after-log` (application stdout no longer breaks the worker).
+Next writes caches into `runtime/.next/server/route-cache` while serving, so compare against a fresh copy of the output. The intentional differences from the recorded files are `ssr` and `api-echo-post-json` (cookie join) and `log`/`after-log` (application stdout no longer breaks the worker). Under `run --lambda-local` (start the runner with that flag, then compare) these also differ, by design: `big` becomes a controlled 502 (above the Lambda payload limit), responses are buffered (no `content-length`, cookies after other headers), and duplicate request headers arrive comma-joined without a space (`api-echo-get`), as in payload format 2.0.
 
 ## Next.js tracing
 

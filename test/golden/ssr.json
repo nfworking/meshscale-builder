@@ -23,12 +23,12 @@
     ]
   ],
   "body": {
-    "length": 5122,
-    "sha256": "97b08e28fa084dca06de1bd540efbe36888c635c82d610a560dda12f83f9df7c",
+    "length": 5166,
+    "sha256": "37abe991ad4eaa941c750a5ea48fd6a391ff143b2775074373084474ba6c72c4",
     "marked": [
       [
         "echo",
-        "{&quot;host&quot;:null,&quot;x-test&quot;:&quot;one&quot;,&quot;cookie&quot;:&quot;a=1, b=2&quot;,&quot;cookies&quot;:[[&quot;a&quot;,&quot;1, b=2&quot;]]}"
+        "{&quot;host&quot;:&quot;golden.localhost&quot;,&quot;x-test&quot;:&quot;one&quot;,&quot;cookie&quot;:&quot;a=1, b=2&quot;,&quot;cookies&quot;:[[&quot;a&quot;,&quot;1, b=2&quot;]]}"
       ]
     ]
   }

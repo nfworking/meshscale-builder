@@ -17,6 +17,7 @@ const path = require('node:path');
 
 const VOLATILE = new Set(['date', 'keep-alive', 'connection']);
 const TIMEOUT_MS = 15000;
+const HOST = 'golden.localhost';
 
 function parseArgs(argv) {
   const args = { dir: path.join(__dirname), mode: null, base: null, only: null };
@@ -38,6 +39,9 @@ function send(base, { method = 'GET', path: requestPath, headers = [], body }) {
   const url = new URL(base);
   return new Promise((resolve) => {
     const rawHeaders = [...headers];
+    // With an array of raw headers Node does not add Host itself. A fixed host keeps
+    // recordings independent of the port (the runner serves any host for one output).
+    if (!rawHeaders.some(([name]) => name.toLowerCase() === 'host')) rawHeaders.unshift(['host', HOST]);
     if (body) rawHeaders.push(['content-length', String(body.length)]);
     const request = http.request({
       host: url.hostname,
@@ -46,7 +50,6 @@ function send(base, { method = 'GET', path: requestPath, headers = [], body }) {
       path: requestPath,
       // An array of [name, value] pairs keeps duplicates as separate header lines.
       headers: rawHeaders.flat(),
-      setHost: !rawHeaders.some(([name]) => name.toLowerCase() === 'host'),
     });
     const timer = setTimeout(() => {
       request.destroy();
@@ -180,7 +183,7 @@ async function runCase(base, testCase, state) {
     return summarize(await send(base, {
       method: 'POST',
       path: '/action',
-      headers: [['content-type', form.type], ['origin', base]],
+      headers: [['content-type', form.type], ['origin', `http://${HOST}`]],
       body: form.body,
     }));
   }

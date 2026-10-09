@@ -456,6 +456,23 @@ mod tests {
         assert_eq!(args.output, Some(PathBuf::from(".meshscale/output")));
         assert_eq!(args.port, 8080);
         assert!(args.projects.is_empty());
+        assert!(!args.lambda_local);
+
+        let Commands::Run(args) = Cli::try_parse_from([
+            "meshscale-builder",
+            "run",
+            ".meshscale/output",
+            "--lambda-local",
+            "--idle-timeout-secs",
+            "5",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected run command");
+        };
+        assert!(args.lambda_local);
+        assert_eq!(args.idle_timeout_secs, 5);
 
         let cli = Cli::try_parse_from([
             "meshscale-builder",

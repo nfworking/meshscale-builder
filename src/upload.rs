@@ -779,17 +779,17 @@ pub(crate) mod tests {
         }
     }
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _root: tempfile::TempDir,
         output: PathBuf,
     }
     impl Fixture {
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.output
         }
     }
 
-    fn fixture() -> Result<Fixture> {
+    pub(crate) fn fixture() -> Result<Fixture> {
         let root = tempfile::TempDir::new()?;
         let output = Fixture {
             output: root.path().join("output"),

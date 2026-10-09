@@ -31,6 +31,9 @@ use crate::{artifact, manifest};
 
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 const MAX_WIRE_HEADER: usize = 1024 * 1024;
+/// Development-only local Lambda Function URL emulation (`--lambda-local`). Embedded in the
+/// binary and staged to a temporary file; never part of an artifact.
+const LAMBDA_LOCAL_HOST: &str = include_str!("lambda_local_host.cjs");
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -45,6 +48,23 @@ pub struct RunArgs {
     /// Idle time before a warm function worker is stopped.
     #[arg(long, default_value_t = 300)]
     pub idle_timeout_secs: u64,
+    /// Send dynamic requests through the artifact's lambda-entry.cjs using a local
+    /// Lambda Function URL emulation instead of function-entry.cjs.
+    #[arg(long)]
+    pub lambda_local: bool,
+}
+
+fn stage_lambda_host() -> Result<tempfile::TempPath> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("meshscale-lambda-local-")
+        .suffix(".cjs")
+        .tempfile()
+        .context("failed to stage the local Lambda host")?;
+    file.write_all(LAMBDA_LOCAL_HOST.as_bytes())
+        .context("failed to write the local Lambda host")?;
+    // Closes the handle; the file is deleted when the TempPath is dropped.
+    Ok(file.into_temp_path())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -473,7 +493,14 @@ pub fn run(args: RunArgs) -> Result<()> {
 }
 
 async fn run_async(args: RunArgs) -> Result<()> {
-    let projects = load_projects(&args)?;
+    // Kept alive until this function returns, so the file exists for every worker start.
+    let lambda_host = args.lambda_local.then(stage_lambda_host).transpose()?;
+    let projects = load_projects(&args, lambda_host.as_deref())?;
+    if args.lambda_local {
+        info!(
+            "LAMBDA LOCAL MODE: dynamic requests go through runtime/lambda-entry.cjs; this is an emulation, not AWS"
+        );
+    }
     let default = if projects.len() == 1 && args.projects.is_empty() {
         projects.values().next().cloned()
     } else {
@@ -516,7 +543,10 @@ async fn run_async(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>> {
+fn load_projects(
+    args: &RunArgs,
+    lambda_host: Option<&std::path::Path>,
+) -> Result<HashMap<String, Arc<ProjectRuntime>>> {
     ensure!(
         args.output.is_some() || !args.projects.is_empty(),
         "provide an output directory or at least one --project HOST=OUTPUT"
@@ -561,6 +591,17 @@ fn load_projects(args: &RunArgs) -> Result<HashMap<String, Arc<ProjectRuntime>>>
             manifest.runtime.entrypoint == PathBuf::from("runtime/function-entry.cjs"),
             "runner requires a MeshScale function artifact"
         );
+        let entrypoint = match lambda_host {
+            Some(host) => {
+                ensure!(
+                    cwd.join("lambda-entry.cjs").is_file(),
+                    "--lambda-local needs runtime/lambda-entry.cjs in {}; rebuild with a Lambda-capable builder",
+                    output.display()
+                );
+                host.to_path_buf()
+            }
+            None => entrypoint,
+        };
 
         let function = Arc::new(FunctionManager {
             output: output.clone(),
@@ -714,5 +755,67 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
             error!(error = %error, "function invocation failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(output: &std::path::Path, lambda_local: bool) -> RunArgs {
+        RunArgs {
+            output: Some(output.to_path_buf()),
+            projects: Vec::new(),
+            port: 3000,
+            idle_timeout_secs: 300,
+            lambda_local,
+        }
+    }
+
+    #[test]
+    fn stages_the_lambda_host_and_deletes_it_on_drop() -> Result<()> {
+        let staged = stage_lambda_host()?;
+        let path = staged.to_path_buf();
+        assert_eq!(std::fs::read_to_string(&path)?, LAMBDA_LOCAL_HOST);
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("cjs")
+        );
+        drop(staged);
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_local_requires_lambda_entry_and_swaps_the_worker_entrypoint() -> Result<()> {
+        let output = crate::upload::tests::fixture()?;
+        let host = stage_lambda_host()?;
+
+        let projects = load_projects(&args(output.path(), false), None)?;
+        assert!(
+            projects["*"]
+                .function
+                .entrypoint
+                .ends_with("function-entry.cjs")
+        );
+
+        let error = load_projects(&args(output.path(), true), Some(&host))
+            .err()
+            .context("expected missing lambda-entry.cjs to fail")?;
+        assert!(
+            format!("{error:#}").contains("lambda-entry.cjs"),
+            "{error:#}"
+        );
+
+        std::fs::write(
+            output.path().join("runtime").join("lambda-entry.cjs"),
+            "// test",
+        )?;
+        let projects = load_projects(&args(output.path(), true), Some(&host))?;
+        let function = &projects["*"].function;
+        assert_eq!(function.entrypoint, host.to_path_buf());
+        // The shim runs with the artifact runtime as its working directory, like the real worker.
+        assert!(function.cwd.ends_with("runtime"));
+        Ok(())
     }
 }

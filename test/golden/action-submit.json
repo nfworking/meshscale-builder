@@ -1,9 +1,17 @@
 {
-  "status": 500,
+  "status": 303,
   "headers": [
     [
       "vary",
       "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch"
+    ],
+    [
+      "cache-control",
+      "no-cache, no-store, max-age=0, must-revalidate"
+    ],
+    [
+      "location",
+      "/action?done=golden"
     ],
     [
       "transfer-encoding",
@@ -11,7 +19,7 @@
     ]
   ],
   "body": {
-    "length": 21,
-    "sha256": "e41656eb2ba6c6293bf6dd928e5a88cdbc50535cab661c1969e0f598e497ed62"
+    "length": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }
 }
