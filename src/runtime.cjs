@@ -101,6 +101,21 @@ class RuntimeResponse extends Writable {
     return this;
   }
 
+  // Like Node's ServerResponse.appendHeader: adds value(s) to any existing ones, so the
+  // header is sent once per value. Next.js uses it for prerendered pages.
+  appendHeader(name, value) {
+    if (this.headersSent) throw new Error('headers already sent');
+    const key = String(name).toLowerCase();
+    const added = Array.isArray(value) ? value : [value];
+    const existing = this.headers.get(key);
+    if (existing === undefined) {
+      this.headers.set(key, Array.isArray(value) ? [...value] : value);
+    } else {
+      this.headers.set(key, [...(Array.isArray(existing) ? existing : [existing]), ...added]);
+    }
+    return this;
+  }
+
   getHeader(name) {
     return this.headers.get(String(name).toLowerCase());
   }

@@ -141,7 +141,7 @@ stdout carries only protocol frames. Application output (`console.log`, `console
 
 `runtime/lambda-entry.cjs` exports a Lambda handler for Function URL events (payload format 2.0). `lambda-adapter.cjs` converts each event into a runtime request and the runtime response back into a Lambda result:
 
-- The URL is `rawPath` plus `rawQueryString`, never decoded and never rebuilt from `queryStringParameters`. `cookies[]` becomes one `cookie` header joined with `; `.
+- The URL is `rawPath` plus `rawQueryString`, never decoded and never rebuilt from `queryStringParameters`. `cookies[]` becomes one `cookie` header joined with `; `; the comma-joined `cookie` header that a real Function URL also sends is dropped, because commas can occur inside cookie values.
 - The edge must send the application's host in `x-forwarded-host`; it replaces the Function URL's own `host` (and is kept). Production must use an authenticated origin, since a public URL lets clients forge it.
 - Every `Set-Cookie` goes into `cookies[]`. Other headers are lowercased and repeats joined with `, `; hop-by-hop headers and (except for `HEAD`) `content-length` are dropped. Textual UTF-8 bodies are returned as strings, everything else base64. `HEAD`, 204, 205 and 304 responses have no body.
 - The response is buffered. A body above the Lambda payload limit (6,291,556 bytes for the encoded result), or a failure after the response head, returns a controlled `502` with `x-meshscale-error`. Application 5xx responses are returned as responses.
@@ -339,7 +339,7 @@ cargo run -- run target/meshscale-fixture/output --port 3100
 node test/golden/golden.cjs --base http://127.0.0.1:3100 --compare
 ~~~
 
-Next writes caches into `runtime/.next/server/route-cache` while serving, so compare against a fresh copy of the output. The intentional differences from the recorded files are `ssr` and `api-echo-post-json` (cookie join) and `log`/`after-log` (application stdout no longer breaks the worker). Under `run --lambda-local` (start the runner with that flag, then compare) these also differ, by design: `big` becomes a controlled 502 (above the Lambda payload limit), responses are buffered (no `content-length`, cookies after other headers), and duplicate request headers arrive comma-joined without a space (`api-echo-get`), as in payload format 2.0.
+Next writes caches into `runtime/.next/server/route-cache` while serving, so compare against a fresh copy of the output. The intentional differences from the recorded files are `ssr` and `api-echo-post-json` (cookie join), `log`/`after-log` (application stdout no longer breaks the worker) and `static-home` (500 before the response object had `appendHeader`, 200 now). Under `run --lambda-local` (start the runner with that flag, then compare) these also differ, by design: `big` becomes a controlled 502 (above the Lambda payload limit), responses are buffered (no `content-length`, cookies after other headers), and duplicate request headers arrive comma-joined without a space (`api-echo-get`), as in payload format 2.0.
 
 ## Next.js tracing
 

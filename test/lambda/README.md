@@ -11,6 +11,13 @@ write results to files that are reviewed afterwards. Nothing here touches the ed
   files or chat. For `curl --aws-sigv4`, export temporary credentials into your shell with
   `eval "$(aws configure export-credentials --format env)"`.
 - Never create a Function URL with `--auth-type NONE` for anything in this runbook.
+- If your IAM user cannot create roles, reuse an existing Lambda execution role with only
+  basic execution permissions (`--role <its ARN>`); its log permissions may not cover the new
+  function, so CloudWatch logs (and the HEAD capture in step 5) may be missing.
+- Instead of `curl --aws-sigv4` you can use `node test/lambda/signed-fetch.cjs` (works on
+  Windows too, takes credentials from the AWS CLI chain, never puts them on a command line):
+  `node test/lambda/signed-fetch.cjs --region $AWS_REGION --url "${URL}ssr" -H x-forwarded-host:app.example.test --include`,
+  and `--concurrent 10` for the concurrency check. On Git Bash, set `MSYS_NO_PATHCONV=1`.
 - A **Linux build host on the Lambda architecture**, with glibc (Amazon Linux 2023 or
   Ubuntu; not Alpine), Node.js 24, Rust 1.88+, git and network access. An EC2 instance works:
   x86_64 (for example `m7i.large`) for `--arch x86_64`, Graviton (`m7g.large`) for `--arch arm64`.

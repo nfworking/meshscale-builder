@@ -105,6 +105,17 @@ module.exports = async (req, res) => {
 globalThis.countedLoads = (globalThis.countedLoads || 0) + 1;
 exports.handler = async (req, res) => res.end(String(globalThis.countedLoads));`,
   'not-a-function.cjs': `module.exports = { nope: true };`,
+  // Next.js 16.4 calls appendHeader for prerendered App Router pages (K12).
+  'append-header.cjs': `
+module.exports = async (req, res) => {
+  res.setHeader('vary', 'rsc');
+  if (res.appendHeader('vary', 'accept') !== res) throw new Error('appendHeader must return the response');
+  res.appendHeader('x-new', 'one');
+  res.appendHeader('set-cookie', 'a=1');
+  res.appendHeader('set-cookie', ['b=2', 'c=3']);
+  res.end('ok');
+  try { res.appendHeader('x-late', '1'); } catch (error) { globalThis.lateAppend = error.message; }
+};`,
 };
 
 const ROUTES = Object.keys(HANDLERS).map((file) => '/' + file.replace(/\.cjs$/, ''));
@@ -269,6 +280,22 @@ test('K6: resolveRoutes headers, status and rewritten query are ignored', async 
   assert.ok(!response.headers.some(([name]) => name === 'x-from-routing'));
   const echoed = JSON.parse((await collect(response)).toString('utf8'));
   assert.equal(echoed.url, '/k6?original=1');
+});
+
+test('appendHeader adds values like Node, including set-cookie arrays (K12)', async () => {
+  const runtime = await runtimePromise;
+  const response = await runtime.invoke(request('/append-header'));
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.headers, [
+    ['vary', 'rsc'],
+    ['vary', 'accept'],
+    ['x-new', 'one'],
+    ['set-cookie', 'a=1'],
+    ['set-cookie', 'b=2'],
+    ['set-cookie', 'c=3'],
+  ]);
+  assert.equal((await collect(response)).toString(), 'ok');
+  assert.match(globalThis.lateAppend, /headers already sent/);
 });
 
 test('handlers are loaded once and cached', async () => {

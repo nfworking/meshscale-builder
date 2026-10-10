@@ -87,13 +87,15 @@ These exist today. Items marked "plan" are fixed by the phase named. The rest ar
 | K8 | **Resolved in Phase 4:** the stable Adapter API is Next.js 16.2 (16.0/16.1 had an alpha with `routes` instead of `routing` and no `buildId`); `build` and `package lambda` now require 16.2.0, and the contract says so. Original finding: `DEPLOYMENT-CONTRACT.md` says Next majors 14-16 are understood, but the build requires the adapter hook (`NEXT_ADAPTER_PATH`) and fails if `meshscale-adapter.json` is missing. **[VERIFY]** which Next versions support that hook. The effective minimum is probably higher than 14. | `artifact.rs::create_output` bails without the adapter metadata | Phase 4: find the real minimum, record it, fail early with a clear message if the installed Next is older. |
 | K9 | CI (`.github/workflows/arch-gpt-check.yml`) only runs on pushes to `arch/gpt` and only syntax-checks `src/function_entry.cjs`. | workflow file | Phase 1: check every `.cjs`, run the Node tests; ask the owner about triggers. |
 | K10 | Request header `transfer-encoding: chunked` is passed through to the worker even though the runner buffers the body. | `runner.rs::invoke` copies all headers | Record. The Lambda path drops it (the shim and adapter both do). |
-| K12 | Found in Phase 1 (fixture, Next 16.4.0). The runtime's response object has no `appendHeader`. Next calls it for prerendered App Router pages, so `/` returns 500 (`r.appendHeader is not a function`) when it reaches the function. | `test/golden/static-home.json` | Record. Small fix (add `appendHeader`) when the owner approves; it changes golden `static-home`. |
+| K12 | **Fixed after Phase 5:** `RuntimeResponse.appendHeader` added with Node semantics (unit test; `/` now returns 200 through IPC and `--lambda-local`; golden `static-home` changes from 500 to 200). Original finding (Phase 1, fixture, Next 16.4.0): The runtime's response object has no `appendHeader`. Next calls it for prerendered App Router pages, so `/` returns 500 (`r.appendHeader is not a function`) when it reaches the function. | `test/golden/static-home.json` | Record. Small fix (add `appendHeader`) when the owner approves; it changes golden `static-home`. |
 | K13 | Found in Phase 1. The fixture's `/` is not served statically: `fallback_reasons` contains `/:missing-html`, so `static_output.rs` does not find Next 16.4's prerender HTML where it looks. The matrix row "static page `/` never reaches Lambda" does not hold today. | fixture `manifest.json` | Record; investigate the prerender output location for Next 16.4. |
 | K14 | **Withdrawn in Phase 3.** Reported in Phase 1 as "App Router sees `host` as null and Server Actions fail". The cause was the golden harness: it passed raw header arrays to `http.request`, so Node sent no `Host` header. With `Host` sent, `host` is correct and the Server Action returns 303 through both IPC and `--lambda-local` (origin check passes via `x-forwarded-host`). Goldens were re-recorded from the pre-refactor runner and artifact. | `test/golden/ssr.json`, `action-submit.json` | None. |
-| K15 | Found in Phase 1. Next writes `runtime/.next/server/route-cache/...` while serving prerendered pages. Lambda's code directory is read-only, so this will fail there, and locally it mutates the artifact (goldens must run on a fresh copy). | file timestamps after a golden run | Must be resolved before Phase 4/5 (cache handler or cache dir under `/tmp`). |
+| K15 | **Downgraded after K12 was fixed:** with the package extracted into a directory the process cannot write to (Windows ACL, standing in for Lambda's read-only `/var/task`), Next logs `Failed to update prerender cache for / ... EPERM` and still serves 200; the next request is a cache HIT from memory. Not fatal, but one error line per cold environment and no on-disk cache. Not yet confirmed on real Lambda (`EROFS` there). Original finding (Phase 1): Next writes `runtime/.next/server/route-cache/...` while serving prerendered pages. Lambda's code directory is read-only, so this will fail there, and locally it mutates the artifact (goldens must run on a fresh copy). | file timestamps after a golden run | Must be resolved before Phase 4/5 (cache handler or cache dir under `/tmp`). |
 | K16 | README describes opt-in npm/pnpm integration tests that install and publish real apps; none exist in the code (`upload.rs::publish_real_fixture` is an unused leftover). | `README.md` "Validation", clippy dead-code list | Record. Phase 1 adds `build::tests::builds_fixture_app` (ignored) for the fixture. |
 | K17 | Baseline on Windows before Phase 0: `cargo fmt --check` fails (build.rs, main.rs, manifest.rs), `cargo clippy -D warnings` fails (unused code in cache.rs/stats.rs/runner.rs plus two runner.rs lints), and two tests fail (`adapter_routing_uses_detected_package_manager` expects `npm` but gets `npm.cmd`; `formats_durations` expects `1m 5s` but gets `1m 5.0s`). | Phase 0 baseline run | Record; not fixed (not listed in the plan). |
 | K18 | Found in Phase 2. The runtime only works when `process.cwd()` is the runtime root: Next resolves `.next/` from `requestMeta.relativeProjectDir: '.'` against the cwd (a route handler fails with `ENOENT .../.next/routes-manifest.json` otherwise). The IPC worker and Lambda (`/var/task`) both satisfy this. | manual invocation from another directory | Record. If needed later, pass `path.relative(process.cwd(), root) \|\| '.'` as `relativeProjectDir` instead of relying on the cwd. |
+| K19 | **Found and fixed in Phase 5** (real Function URL). Payload v2 keeps a `cookie` header, comma-joined (`"a=1,b=2"`), next to `cookies[]`; Appendix A said the header is removed. The adapter appended `cookies[]` as a second header, so apps saw `a=1,b=2; a=1; b=2`. The adapter now drops the header when `cookies[]` is present; the local shim keeps the header like AWS does. Verified on Lambda (two headers, one header, comma inside a value). | `test/fixtures/events/captured-get.json` | Fixed. |
+| K20 | Found in Phase 5. Lambda's `Init Duration` is only 120-170 ms because Next.js route modules load lazily; the real cold cost lands on the first request (`/` 1,656 ms at 512 MB, 753 ms at 1024 MB, 444 ms at 1769 MB, 400 ms at 2048 MB). | `test/lambda/results/direct-latest-*mb.json` | Record. Consider warming the route modules in `start()` (moves the cost into the init phase) after measuring. |
 | K11 | Child processes inherit the builder's full environment, minus a denylist (`remove_credentials`). The denylist covers `MESHSCALE_GITHUB_TOKEN` and the R2 names only. Anything else in the environment (`AWS_*`, cloud tokens) reaches customer install scripts. There is also no way to pass project build-time variables (for example `NEXT_PUBLIC_*`) except by putting them in the builder's own environment. | `build.rs::run_command`, `run_build`; `upload.rs::remove_credentials` | Phase 0. |
 
 ## 4. Design decisions
@@ -335,6 +337,12 @@ Acceptance: deterministic zip; all checks have failing-case tests; the size repo
 with static files served locally.
 
 Acceptance: every matrix row passes on real Lambda or is recorded as unsupported with a reason.
+
+**Phase 5 results (2026-10-10, us-east-2, x86_64, nodejs24.x, Linux-built zip `d72be2f6...`, Lambda `CodeSha256` matched `zip_sha256`):**
+- Direct-invoke matrix (`test/lambda/invoke-matrix.cjs`): every case passes on version 1 and at 512/1024/1769/2048 MB. `/` returns 500 because of K12 (`r.appendHeader is not a function`), so the read-only route-cache write (K15) is not reached and remains untested on Lambda. `after()` completes before the handler returns. `/big` returns the controlled 502. A 6.5 MB request is rejected by Lambda: "Request must be smaller than 6291456 bytes" (requests are capped at 6 MiB; the 6,291,556 figure used for responses comes from AWS response errors and is still unverified against an over-limit response that reaches Lambda's own check, because the adapter stops at it first).
+- AWS_IAM Function URL on the `live` alias (`test/lambda/signed-fetch.cjs`, SigV4 in Node, credentials from the AWS CLI chain): unsigned 403, signed 200, two `Set-Cookie` headers, binary SHA-256 preserved, HEAD without body, 307 with `location`, encoded path single-decoded like IPC, 10 truly concurrent requests each received their own response. K19 found here and fixed (version 2, adapter patched into the same zip for the test; rebuild on Linux for a real package).
+- Captured, redacted events: `test/fixtures/events/captured-{get,post-json,post-binary}.json`. HEAD not captured (no CloudWatch log group: the test reused an existing role that only allows logging for another function).
+- Not done: 5.4 `--lambda-endpoint` (owner decision), K15 on Lambda (blocked by K12), emulator layer (Docker).
 
 ### Phase 6 — Orchestration (outside this repository; requirements only)
 
@@ -655,7 +663,7 @@ routes `/_next/image`), i18n beyond what is tested.
 5. Is a manifest-level Lambda contract wanted, or is the sidecar enough (D4)?
 6. CI triggers (K9) and whether Docker is acceptable in CI for the emulator layer.
 
-## Appendix A — Function URL payload format 2.0 [VERIFY against a captured real event]
+## Appendix A — Function URL payload format 2.0 (corrected in Phase 5 from captured events; see `test/fixtures/events/captured-*.json`)
 
 Request event (fields the runtime depends on are marked *):
 
@@ -665,15 +673,17 @@ Request event (fields the runtime depends on are marked *):
   "routeKey": "$default",
   "rawPath": "/products/a%20b",                      // * raw, percent-encoded
   "rawQueryString": "ref=a&ref=b",                   // * raw; "" when there is no query
-  "cookies": ["a=1", "b=2"],                         // * omitted when there are none; the cookie header is NOT in headers
+  "cookies": ["a=1", "b=2"],                         // * omitted when there are none. CORRECTED: the cookie header IS still in headers, comma-joined ("a=1,b=2"); cookies[] is authoritative
   "headers": { "host": "<id>.lambda-url.<region>.on.aws", "x-forwarded-host": "app.example.com", "accept": "text/html,application/json" },
   "queryStringParameters": { "ref": "a,b" },         // do not use: repeated keys are joined
   "requestContext": {
     "accountId": "123456789012", "apiId": "<url-id>", "domainName": "<url-id>.lambda-url.<region>.on.aws",
     "domainPrefix": "<url-id>", "requestId": "…", "routeKey": "$default", "stage": "$default",
     "time": "09/Oct/2026:12:00:00 +0000", "timeEpoch": 1791547200000,
-    "http": { "method": "GET", "path": "/products/a%20b", "protocol": "HTTP/1.1", "sourceIp": "…", "userAgent": "…" }   // * method
+    "http": { "method": "GET", "path": "/products/a b", "protocol": "HTTP/1.1", "sourceIp": "…", "userAgent": "…" }   // * method. CORRECTED: http.path is DECODED; only rawPath keeps the encoding
   },
+  // Also observed: IAM URLs strip Authorization but pass x-amz-date and x-amz-content-sha256,
+  // add x-amzn-tls-version and x-amzn-tls-cipher-suite, and put the caller in requestContext.authorizer.iam.
   "body": "…",                                       // omitted when empty
   "isBase64Encoded": false                           // *
 }
