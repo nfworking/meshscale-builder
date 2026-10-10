@@ -52,6 +52,25 @@ pub struct RunArgs {
     /// Lambda Function URL emulation instead of function-entry.cjs.
     #[arg(long)]
     pub lambda_local: bool,
+    /// Send dynamic requests to this real AWS_IAM Lambda Function URL, signed with SigV4
+    /// using AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN from the environment.
+    /// Static files are still served locally.
+    #[arg(
+        long,
+        value_name = "URL",
+        value_parser = crate::lambda_endpoint::parse_endpoint,
+        conflicts_with = "lambda_local",
+        requires = "lambda_region"
+    )]
+    pub lambda_endpoint: Option<reqwest::Url>,
+    /// AWS region of --lambda-endpoint (used for signing).
+    #[arg(
+        long,
+        value_name = "REGION",
+        value_parser = crate::lambda_endpoint::parse_region,
+        requires = "lambda_endpoint"
+    )]
+    pub lambda_region: Option<String>,
 }
 
 fn stage_lambda_host() -> Result<tempfile::TempPath> {
@@ -478,6 +497,8 @@ struct ProjectRuntime {
     assets_root: PathBuf,
     manifest: Arc<manifest::Manifest>,
     function: Arc<FunctionManager>,
+    /// `--lambda-endpoint`: dynamic requests go here instead of a local worker.
+    remote: Option<Arc<crate::lambda_endpoint::LambdaEndpoint>>,
 }
 
 #[derive(Clone)]
@@ -495,7 +516,19 @@ pub fn run(args: RunArgs) -> Result<()> {
 async fn run_async(args: RunArgs) -> Result<()> {
     // Kept alive until this function returns, so the file exists for every worker start.
     let lambda_host = args.lambda_local.then(stage_lambda_host).transpose()?;
-    let projects = load_projects(&args, lambda_host.as_deref())?;
+    let remote = match (&args.lambda_endpoint, &args.lambda_region) {
+        (Some(endpoint), Some(region)) => Some(Arc::new(
+            crate::lambda_endpoint::LambdaEndpoint::from_env(endpoint.clone(), region.clone())?,
+        )),
+        _ => None,
+    };
+    if let Some(remote) = &remote {
+        info!(
+            endpoint = %remote.origin(),
+            "LAMBDA ENDPOINT MODE: dynamic requests go to a real Lambda Function URL; static files are served locally"
+        );
+    }
+    let projects = load_projects(&args, lambda_host.as_deref(), remote)?;
     if args.lambda_local {
         info!(
             "LAMBDA LOCAL MODE: dynamic requests go through runtime/lambda-entry.cjs; this is an emulation, not AWS"
@@ -546,6 +579,7 @@ async fn run_async(args: RunArgs) -> Result<()> {
 fn load_projects(
     args: &RunArgs,
     lambda_host: Option<&std::path::Path>,
+    remote: Option<Arc<crate::lambda_endpoint::LambdaEndpoint>>,
 ) -> Result<HashMap<String, Arc<ProjectRuntime>>> {
     ensure!(
         args.output.is_some() || !args.projects.is_empty(),
@@ -628,6 +662,7 @@ fn load_projects(
                 assets_root,
                 manifest,
                 function,
+                remote: remote.clone(),
             }),
         );
     }
@@ -749,6 +784,16 @@ async fn dispatch(project: Arc<ProjectRuntime>, request: Request) -> Response {
         return response.body(Body::from(bytes)).unwrap().into_response();
     }
 
+    if let Some(remote) = &project.remote {
+        return match remote.forward(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                error!(error = %format!("{error:#}"), "Lambda endpoint request failed");
+                StatusCode::BAD_GATEWAY.into_response()
+            }
+        };
+    }
+
     match project.function.invoke(request).await {
         Ok(response) => response,
         Err(error) => {
@@ -769,6 +814,8 @@ mod tests {
             port: 3000,
             idle_timeout_secs: 300,
             lambda_local,
+            lambda_endpoint: None,
+            lambda_region: None,
         }
     }
 
@@ -791,7 +838,7 @@ mod tests {
         let output = crate::upload::tests::fixture()?;
         let host = stage_lambda_host()?;
 
-        let projects = load_projects(&args(output.path(), false), None)?;
+        let projects = load_projects(&args(output.path(), false), None, None)?;
         assert!(
             projects["*"]
                 .function
@@ -799,7 +846,7 @@ mod tests {
                 .ends_with("function-entry.cjs")
         );
 
-        let error = load_projects(&args(output.path(), true), Some(&host))
+        let error = load_projects(&args(output.path(), true), Some(&host), None)
             .err()
             .context("expected missing lambda-entry.cjs to fail")?;
         assert!(
@@ -811,7 +858,7 @@ mod tests {
             output.path().join("runtime").join("lambda-entry.cjs"),
             "// test",
         )?;
-        let projects = load_projects(&args(output.path(), true), Some(&host))?;
+        let projects = load_projects(&args(output.path(), true), Some(&host), None)?;
         let function = &projects["*"].function;
         assert_eq!(function.entrypoint, host.to_path_buf());
         // The shim runs with the artifact runtime as its working directory, like the real worker.

@@ -203,6 +203,17 @@ Local mode is necessary but not sufficient. It does not emulate:
 | Response streaming | Responses are buffered. |
 | Real header normalization by Lambda | Compare against events captured from a real Function URL. |
 
+### Real Lambda behind the local runner
+
+`run --lambda-endpoint <URL> --lambda-region <REGION>` serves static files locally and forwards every dynamic request to a real `AWS_IAM` Lambda Function URL, so a browser can exercise real Lambda without the edge:
+
+~~~bash
+eval "$(aws configure export-credentials --format env)"
+cargo run -- run .meshscale/output --lambda-endpoint https://<id>.lambda-url.us-east-2.on.aws/ --lambda-region us-east-2
+~~~
+
+The runner signs each request with SigV4 (service `lambda`, the real payload hash in `x-amz-content-sha256`) using `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional `AWS_SESSION_TOKEN` from its own environment. Credentials are never logged, and no Node worker is started in this mode. The browser's host goes in `x-forwarded-host`. Request bodies above Lambda's 6,291,456 byte request limit get a local `413`. Incoming `authorization` and `x-amz-*` headers are not forwarded (an `AWS_IAM` Function URL consumes `authorization` anyway, so apps behind it never see one). The calling principal needs `lambda:InvokeFunctionUrl` (and `lambda:InvokeFunction`) on the function. It is mutually exclusive with `--lambda-local`, and plain `http` endpoints are accepted only on loopback addresses.
+
 Multiple deployments can share one local edge process:
 
 ~~~bash

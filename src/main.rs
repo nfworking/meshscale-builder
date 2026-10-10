@@ -15,6 +15,7 @@ mod cache;
 mod cli;
 mod env;
 mod lambda;
+mod lambda_endpoint;
 mod manifest;
 mod routing;
 mod runner;
@@ -480,6 +481,51 @@ mod tests {
         };
         assert!(args.lambda_local);
         assert_eq!(args.idle_timeout_secs, 5);
+        assert!(args.lambda_endpoint.is_none() && args.lambda_region.is_none());
+
+        let run = |extra: &[&str]| {
+            let mut argv = vec!["meshscale-builder", "run", ".meshscale/output"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Commands::Run(args) = run(&[
+            "--lambda-endpoint",
+            "https://abc.lambda-url.us-east-2.on.aws/",
+            "--lambda-region",
+            "us-east-2",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.lambda_endpoint.unwrap().as_str(),
+            "https://abc.lambda-url.us-east-2.on.aws/"
+        );
+        assert_eq!(args.lambda_region.as_deref(), Some("us-east-2"));
+        for invalid in [
+            vec![
+                "--lambda-endpoint",
+                "https://abc.lambda-url.us-east-2.on.aws/",
+            ],
+            vec!["--lambda-region", "us-east-2"],
+            vec![
+                "--lambda-endpoint",
+                "https://abc.lambda-url.us-east-2.on.aws/",
+                "--lambda-region",
+                "us-east-2",
+                "--lambda-local",
+            ],
+            vec![
+                "--lambda-endpoint",
+                "http://abc.lambda-url.us-east-2.on.aws/",
+                "--lambda-region",
+                "us-east-2",
+            ],
+        ] {
+            assert!(run(&invalid).is_err(), "{invalid:?}");
+        }
 
         let cli = Cli::try_parse_from([
             "meshscale-builder",
