@@ -1,0 +1,59 @@
+{
+  "_source": "captured from a real Lambda Function URL on 2026-10-09; redacted by test/lambda/redact-event.cjs",
+  "version": "2.0",
+  "routeKey": "$default",
+  "rawPath": "/products/a%20b",
+  "rawQueryString": "ref=a&ref=b&x=%2F",
+  "cookies": [
+    "a=1",
+    "b=2"
+  ],
+  "headers": {
+    "x-amz-content-sha256": "<redacted>",
+    "x-amzn-tls-version": "TLSv1.3",
+    "cookie": "a=1,b=2",
+    "x-amz-date": "<redacted>",
+    "x-forwarded-proto": "https",
+    "x-multi": "one,two",
+    "x-forwarded-port": "443",
+    "x-forwarded-for": "203.0.113.10",
+    "x-amzn-tls-cipher-suite": "TLS_AES_128_GCM_SHA256",
+    "x-amzn-trace-id": "Root=1-00000000-000000000000000000000000",
+    "x-forwarded-host": "app.example.test",
+    "host": "abcdefghijklmnopqrstuvwxyz012345.lambda-url.us-east-2.on.aws"
+  },
+  "queryStringParameters": {
+    "ref": "a,b",
+    "x": "/"
+  },
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "abcdefghijklmnopqrstuvwxyz012345",
+    "authorizer": {
+      "iam": {
+        "accessKey": "<redacted>",
+        "accountId": "<redacted>",
+        "callerId": "<redacted>",
+        "cognitoIdentity": null,
+        "principalOrgId": null,
+        "userArn": "<redacted>",
+        "userId": "<redacted>"
+      }
+    },
+    "domainName": "abcdefghijklmnopqrstuvwxyz012345.lambda-url.us-east-2.on.aws",
+    "domainPrefix": "abcdefghijklmnopqrstuvwxyz012345",
+    "http": {
+      "method": "GET",
+      "path": "/products/a b",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "203.0.113.10",
+      "userAgent": null
+    },
+    "requestId": "00000000-0000-4000-8000-000000000000",
+    "routeKey": "$default",
+    "stage": "$default",
+    "time": "09/Oct/2026:23:23:11 +0000",
+    "timeEpoch": 1791588191616
+  },
+  "isBase64Encoded": false
+}

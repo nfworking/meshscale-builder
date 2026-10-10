@@ -1,5 +1,5 @@
 {
-  "_source": "hand-written from the documented Function URL payload format 2.0 (LAMBDA-PLAN.md Appendix A); replace with a captured event in Phase 5",
+  "_source": "hand-written from the documented payload format 2.0, corrected in Phase 5: a real Function URL keeps the comma-joined cookie header next to cookies[] (see captured-get.json)",
   "version": "2.0",
   "routeKey": "$default",
   "rawPath": "/api/echo",
@@ -9,6 +9,7 @@
     "b=2"
   ],
   "headers": {
+    "cookie": "a=1,b=2",
     "host": "abcdefghijklmnopqrstuvwxyz012345.lambda-url.us-east-1.on.aws",
     "x-forwarded-host": "app.example.test",
     "x-forwarded-proto": "https",

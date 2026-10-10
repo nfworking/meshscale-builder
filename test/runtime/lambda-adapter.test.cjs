@@ -115,6 +115,31 @@ test('cookies[] becomes one cookie header joined with "; "', () => {
   assert.equal(none.headers.filter(([name]) => name === 'cookie').length, 0);
 });
 
+test('captured event: the comma-joined cookie header and cookies[] become one cookie list', () => {
+  // A real Function URL keeps a `cookie` header ("a=1,b=2") next to cookies[] (Phase 5).
+  const captured = event('captured-get');
+  assert.equal(captured.headers.cookie, 'a=1,b=2');
+  assert.deepEqual(captured.cookies, ['a=1', 'b=2']);
+  const request = fromLambdaEvent(captured);
+  assert.deepEqual(request.headers.filter(([name]) => name === 'cookie'), [['cookie', 'a=1; b=2']]);
+  // Without cookies[], a cookie header is used as given.
+  const headerOnly = fromLambdaEvent({ ...event('get-basic'), headers: { cookie: 'x=1; y=2' } });
+  assert.deepEqual(headerOnly.headers.filter(([name]) => name === 'cookie'), [['cookie', 'x=1; y=2']]);
+});
+
+test('captured events: raw path and query, base64 bodies and forwarded host', () => {
+  const get = fromLambdaEvent(event('captured-get'));
+  assert.equal(get.url, '/products/a%20b?ref=a&ref=b&x=%2F');
+  assert.deepEqual(get.headers.find(([name]) => name === 'host'), ['host', 'app.example.test']);
+  assert.ok(get.headers.some(([name, value]) => name === 'x-multi' && value === 'one,two'));
+  assert.ok(!get.headers.some(([name]) => name === 'authorization'), 'AWS strips the signature');
+  const json = fromLambdaEvent(event('captured-post-json'));
+  assert.equal(json.method, 'POST');
+  assert.equal(json.body.toString('utf8'), '{"hello":"world","n":1}');
+  const binary = fromLambdaEvent(event('captured-post-binary'));
+  assert.equal(binary.body.length, 4096);
+});
+
 test('host: x-forwarded-host (first value) replaces the Function URL host and is kept', () => {
   const request = fromLambdaEvent(event('get-basic'));
   assert.deepEqual(request.headers.filter(([name]) => name === 'host'), [['host', 'app.example.test']]);

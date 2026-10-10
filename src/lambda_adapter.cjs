@@ -50,12 +50,15 @@ function fromLambdaEvent(event) {
     : rawPath;
 
   // Payload v2 lowercases names and comma-joins duplicate values; keep them as given.
-  const headers = Object.entries(event.headers || {})
+  let headers = Object.entries(event.headers || {})
     .filter(([, value]) => value !== undefined && value !== null)
     .map(([name, value]) => [name, String(value)]);
 
-  // Payload v2 moves cookies out of the headers.
+  // cookies[] is the authoritative cookie list. A real Function URL also keeps a `cookie`
+  // header with the values comma-joined ("a=1,b=2"), which must not be passed on as well:
+  // commas can appear inside cookie values, so that header cannot be split reliably.
   if (Array.isArray(event.cookies) && event.cookies.length) {
+    headers = headers.filter(([name]) => name.toLowerCase() !== 'cookie');
     headers.push(['cookie', event.cookies.join('; ')]);
   }
 

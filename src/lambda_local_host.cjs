@@ -184,12 +184,14 @@ function buildEvent(header, body) {
     const name = rawName.toLowerCase();
     if (HOP_BY_HOP_REQUEST.has(name)) continue;
     if (name === 'cookie') {
-      // Payload v2 moves cookies out of `headers` into `cookies`.
+      // Payload v2 lists cookies in `cookies`. A real Function URL also keeps the cookie
+      // header, comma-joined like other duplicates (captured in Phase 5: two Cookie headers
+      // "a=1" and "b=2" arrive as cookie "a=1,b=2" plus cookies ["a=1","b=2"]), so it falls
+      // through to the generic header handling below.
       for (const part of String(value).split(';')) {
         const cookie = part.trim();
         if (cookie) cookies.push(cookie);
       }
-      continue;
     }
     if (name === 'host') {
       originalHost = value;

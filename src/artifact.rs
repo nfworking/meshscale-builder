@@ -339,9 +339,12 @@ fn unresolved_staged_import(warning: &str, staging_name: &std::ffi::OsStr) -> Op
     let (specifier, rest) = rest.split_once('"')?;
     let (_, loaded_from) = rest.rsplit_once(" loaded from ")?;
     let relative = specifier.starts_with("./") || specifier.starts_with("../");
-    let staged = Path::new(loaded_from.trim())
-        .components()
-        .any(|component| component.as_os_str() == staging_name);
+    // Split on both separators: Path::components only knows the host's, and the test
+    // inputs (and NFT output) can use either.
+    let staged = loaded_from
+        .trim()
+        .split(['/', '\\'])
+        .any(|component| std::ffi::OsStr::new(component) == staging_name);
     (relative && staged).then(|| specifier.to_owned())
 }
 

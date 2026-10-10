@@ -201,13 +201,13 @@ test('keeps the raw path percent-encoded and does not decode twice', () => withH
   assert.equal(event.rawPath, '/echo/%2e%2e/a%2Fb%20c');
 }, FAKE_ENTRY.replace("event.rawPath;", "event.rawPath.startsWith('/echo') ? '/echo' : event.rawPath;")));
 
-test('moves the cookie header into event.cookies and strips it from headers', () => withHost(async (host) => {
+test('lists cookies in event.cookies and keeps the comma-joined cookie header, like a real Function URL', () => withHost(async (host) => {
   const { event } = await host.json({
     uri: '/echo',
     headers: [['Cookie', 'a=1; b=2'], ['Cookie', 'c=3']],
   });
   assert.deepEqual(event.cookies, ['a=1', 'b=2', 'c=3']);
-  assert.equal(event.headers.cookie, undefined);
+  assert.equal(event.headers.cookie, 'a=1; b=2,c=3');
 }));
 
 test('text bodies stay strings and binary bodies are base64 encoded', () => withHost(async (host) => {
